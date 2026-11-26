@@ -1,0 +1,35 @@
+plugins {
+    id 'java'
+    id 'com.gradleup.shadow'
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release = 17
+    options.encoding = 'UTF-8'
+}
+
+dependencies {
+    implementation project(':pc-engine')
+    testImplementation 'junit:junit:4.13.2'
+}
+
+shadowJar {
+    archiveBaseName.set('hfx-shell')
+    archiveClassifier.set('')
+    manifest {
+        attributes 'Main-Class': 'top.weixiansen574.hybridfilexfer.Main'
+    }
+}
+
+test {
+    useJUnit()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        exceptionFormat = 'full'
+    }
+}

@@ -1,0 +1,30 @@
+# Gradle & local config
+.gradle/
+build/
+**/build/
+local.properties
+
+# Java / IDE compiled artifacts
+*.class
+out/
+**/out/
+.idea/
+*.iml
+*~
+
+# Packaged artifacts & third-party binaries
+*.apk
+*.aab
+*.ap_
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.exe
+*.dll
+
+# .NET build output
+HybridFileXferLauncher/bin/
+HybridFileXferLauncher/obj/
+
+# OS files
+.DS_Store
+Thumbs.db

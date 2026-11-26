@@ -37,10 +37,21 @@ public class IOServiceImpl extends IIOService.Stub {
     public ParcelFileDescriptor createAndOpenWriteableFile(String path,long length){
         try {
             File file = new File(path);
-            RandomAccessFile randomAccessFile = new RandomAccessFile(file,"rw");
-            randomAccessFile.setLength(length);
-            randomAccessFile.close();
+            if (length >= 0) {
+                RandomAccessFile randomAccessFile = new RandomAccessFile(file,"rw");
+                randomAccessFile.setLength(length);
+                randomAccessFile.close();
+            }
             return ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_WRITE_ONLY);
+        } catch (IOException e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+
+    public ParcelFileDescriptor openExistingWriteableFile(String path) {
+        try {
+            return ParcelFileDescriptor.open(new File(path), ParcelFileDescriptor.MODE_WRITE_ONLY);
         } catch (IOException e) {
             e.printStackTrace();
             return null;

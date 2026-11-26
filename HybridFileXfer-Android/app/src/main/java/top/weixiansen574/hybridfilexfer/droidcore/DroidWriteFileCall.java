@@ -9,13 +9,12 @@ import java.nio.channels.FileChannel;
 import java.util.concurrent.LinkedBlockingDeque;
 
 import top.weixiansen574.hybridfilexfer.aidl.IIOService;
+import top.weixiansen574.hybridfilexfer.core.OpenFileHandle;
 import top.weixiansen574.hybridfilexfer.core.WriteFileCall;
 
 public class DroidWriteFileCall extends WriteFileCall {
     private final IIOService ioService;
-    private ParcelFileDescriptor pfd;
-    private FileOutputStream fileOutputStream;
-    private FileChannel channel;
+
     public DroidWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount, IIOService ioService) {
         super(buffers, dequeCount);
         this.ioService = ioService;
@@ -24,7 +23,7 @@ public class DroidWriteFileCall extends WriteFileCall {
     @Override
     protected void createParentDirIfNotExists(String path) throws Exception {
         String exception = ioService.createParentDirIfNotExists(path);
-        if (exception != null){
+        if (exception != null) {
             throw new IOException(exception);
         }
     }
@@ -32,28 +31,56 @@ public class DroidWriteFileCall extends WriteFileCall {
     @Override
     protected void tryMkdirs(String path) throws Exception {
         String exception = ioService.tryMkdirs(path);
-        if (exception != null){
+        if (exception != null) {
             throw new IOException(exception);
         }
     }
 
     @Override
-    protected FileChannel createAndOpenFile(String path, long length) throws Exception {
-        pfd = ioService.createAndOpenWriteableFile(path, length);
-        fileOutputStream = new FileOutputStream(pfd.getFileDescriptor());
-        channel = fileOutputStream.getChannel();
-        return channel;
-    }
-
-    @Override
-    protected void closeFile() throws Exception {
-        channel.close();
-        fileOutputStream.close();
-        pfd.close();
+    protected OpenFileHandle openWritableFile(String path, long totalSize, boolean preallocate) throws Exception {
+        ParcelFileDescriptor pfd = preallocate
+                ? ioService.createAndOpenWriteableFile(path, totalSize)
+                : ioService.openExistingWriteableFile(path);
+        if (pfd == null) {
+            throw new IOException("Failed to open writable file via IIOService: " + path);
+        }
+        FileOutputStream fos = new FileOutputStream(pfd.getFileDescriptor());
+        FileChannel ch = fos.getChannel();
+        return new DroidOpenFileHandle(pfd, fos, ch);
     }
 
     @Override
     protected boolean setFileLastModified(String path, long time) throws Exception {
-        return ioService.setFileLastModified(path,time);
+        return ioService.setFileLastModified(path, time);
+    }
+
+    private static final class DroidOpenFileHandle implements OpenFileHandle {
+        private final ParcelFileDescriptor pfd;
+        private final FileOutputStream fos;
+        private final FileChannel channel;
+
+        DroidOpenFileHandle(ParcelFileDescriptor pfd, FileOutputStream fos, FileChannel channel) {
+            this.pfd = pfd;
+            this.fos = fos;
+            this.channel = channel;
+        }
+
+        @Override
+        public FileChannel getChannel() {
+            return channel;
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                channel.close();
+            } finally {
+                try {
+                    fos.close();
+                } finally {
+                    pfd.close();
+                }
+            }
+        }
     }
 }

@@ -3,6 +3,7 @@ package top.weixiansen574.hybridfilexfer.droidcore;
 import android.os.ParcelFileDescriptor;
 
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.util.List;
@@ -20,8 +21,17 @@ public class DroidReadFileCall extends ReadFileCall {
     private FileInputStream fileInputStream;
     private FileChannel channel;
 
-    public DroidReadFileCall(IIOService ioService,LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount) {
+    public DroidReadFileCall(IIOService ioService, LinkedBlockingDeque<ByteBuffer> buffers,
+                             List<RemoteFile> files, Directory localDir, Directory remoteDir,
+                             int operateThreadCount) {
         super(buffers, files, localDir, remoteDir, operateThreadCount);
+        this.ioService = ioService;
+    }
+
+    public DroidReadFileCall(IIOService ioService, LinkedBlockingDeque<ByteBuffer> buffers,
+                             List<RemoteFile> files, Directory localDir, Directory remoteDir,
+                             int operateThreadCount, int blockSize) {
+        super(buffers, files, localDir, remoteDir, operateThreadCount, blockSize);
         this.ioService = ioService;
     }
 
@@ -32,12 +42,15 @@ public class DroidReadFileCall extends ReadFileCall {
 
     @Override
     protected List<RemoteFile> listFiles(String path) throws Exception {
-        return HFXServer.listLocalFiles(ioService,path);
+        return HFXServer.listLocalFiles(ioService, path);
     }
 
     @Override
     protected FileChannel openFile(String path) throws Exception {
         pfd = ioService.openReadableFile(path);
+        if (pfd == null) {
+            throw new IOException("Failed to open readable file via IIOService: " + path);
+        }
         fileInputStream = new FileInputStream(pfd.getFileDescriptor());
         channel = fileInputStream.getChannel();
         return channel;
@@ -45,9 +58,17 @@ public class DroidReadFileCall extends ReadFileCall {
 
     @Override
     protected void closeFile() throws Exception {
-        channel.close();
-        fileInputStream.close();
-        pfd.close();
+        try {
+            if (channel != null) channel.close();
+        } finally {
+            try {
+                if (fileInputStream != null) fileInputStream.close();
+            } finally {
+                if (pfd != null) pfd.close();
+                channel = null;
+                fileInputStream = null;
+                pfd = null;
+            }
+        }
     }
-
 }

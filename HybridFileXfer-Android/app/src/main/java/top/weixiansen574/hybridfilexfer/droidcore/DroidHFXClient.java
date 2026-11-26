@@ -18,8 +18,10 @@ import top.weixiansen574.hybridfilexfer.core.bean.RemoteFile;
 public class DroidHFXClient extends HFXClient {
     private final IIOService iioService;
     private final Context context;
-    public DroidHFXClient(String serverControllerAddress, int serverPort,String homeDir, IIOService iioService, Context context) {
-        super(serverControllerAddress, serverPort,homeDir);
+
+    public DroidHFXClient(String serverControllerAddress, int serverPort, String homeDir,
+                          IIOService iioService, Context context) {
+        super(serverControllerAddress, serverPort, homeDir);
         this.iioService = iioService;
         this.context = context;
     }
@@ -34,14 +36,8 @@ public class DroidHFXClient extends HFXClient {
         ActivityManager activityManager = context.getSystemService(ActivityManager.class);
         ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
         activityManager.getMemoryInfo(memoryInfo);
-
-        long totalMemory = memoryInfo.totalMem;
-
-        long availableMemory = memoryInfo.availMem;
-
-        long totalMemoryMB = totalMemory / (1024 * 1024);
-        long availableMemoryMB = availableMemory / (1024 * 1024);
-
+        long totalMemoryMB = memoryInfo.totalMem / (1024 * 1024);
+        long availableMemoryMB = memoryInfo.availMem / (1024 * 1024);
         return (long) (availableMemoryMB - (totalMemoryMB * 0.05));
     }
 
@@ -52,25 +48,31 @@ public class DroidHFXClient extends HFXClient {
 
     @Override
     protected boolean mkdir(String parent, String child) throws Exception {
-        return iioService.appendAndMkdirs(parent,child);
+        return iioService.appendAndMkdirs(parent, child);
     }
 
     @Override
     protected List<RemoteFile> listFiles(String path) throws Exception {
-        return HFXServer.listLocalFiles(iioService,path);
+        return HFXServer.listLocalFiles(iioService, path);
     }
 
     @Override
     protected WriteFileCall createWriteFileCall(LinkedBlockingDeque<ByteBuffer> buffers, int dequeCount) {
-        return new DroidWriteFileCall(buffers,dequeCount,iioService);
+        return new DroidWriteFileCall(buffers, dequeCount, iioService);
     }
 
     @Override
-    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers, List<RemoteFile> files, Directory localDir, Directory remoteDir, int operateThreadCount) {
-        return new DroidReadFileCall(iioService,buffers,files,localDir,remoteDir,operateThreadCount);
+    protected ReadFileCall createReadFileCall(LinkedBlockingDeque<ByteBuffer> buffers,
+                                              List<RemoteFile> files,
+                                              Directory localDir,
+                                              Directory remoteDir,
+                                              int operateThreadCount) {
+        return new DroidReadFileCall(iioService, buffers, files, localDir, remoteDir,
+                operateThreadCount, negotiatedBlockSize);
     }
 
-    public void freeBuffers(){
+    @Override
+    public void freeBuffers() {
         for (ByteBuffer buffer : buffers) {
             NativeMemory.freeBuffer(buffer);
         }
