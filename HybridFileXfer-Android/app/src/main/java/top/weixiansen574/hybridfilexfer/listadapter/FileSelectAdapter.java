@@ -29,17 +29,17 @@ import java.util.LinkedList;
 import java.util.List;
 
 import top.weixiansen574.hybridfilexfer.R;
+import top.weixiansen574.hybridfilexfer.aidl.IHfxEngine;
 import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.bean.Directory;
 import top.weixiansen574.hybridfilexfer.core.bean.RemoteFile;
-import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
 import top.weixiansen574.hybridfilexfer.tasks.DeleteFilesTask;
 import top.weixiansen574.hybridfilexfer.tasks.ListFilesTask;
 
 public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectAdapter.ViewHolder> implements FastScroller.SectionIndexer {
     Activity context;
     LayoutInflater layoutInflater;
-    protected HFXServer server;
+    protected IHfxEngine engine;
     List<RemoteFile> files = new ArrayList<>();
     HashSet<RemoteFile> selectedItems = new HashSet<>();
     public View loadingView;
@@ -54,19 +54,21 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
     private boolean isLoading = false;
 
     public FileSelectAdapter(Activity context, View loadingView, RecyclerView recyclerView, LinearLayoutManager
-            linearLayoutManager, Toolbar fileSelectToolbar, View.OnTouchListener onTouchListener, HFXServer server) {
+            linearLayoutManager, Toolbar fileSelectToolbar, View.OnTouchListener onTouchListener,
+                             IHfxEngine engine, int fileSystem, String initialDir) {
         this.context = context;
-        this.server = server;
+        this.engine = engine;
         this.loadingView = loadingView;
         this.recyclerView = recyclerView;
         this.linearLayoutManager = linearLayoutManager;
         this.onTouchListener = onTouchListener;
         this.fileSelectToolbar = fileSelectToolbar;
-
-        this.fileSystem = getFileSystem(server);
+        this.fileSystem = fileSystem;
 
         layoutInflater = LayoutInflater.from(context);
-        jump(getDefaultDir(server));
+        String startDir = (initialDir != null && !initialDir.isEmpty()) ? initialDir : getDefaultDir();
+        jump(startDir);
+
         fileSelectToolbar.getMenu()
                 .findItem(R.id.select_all)
                 .setOnMenuItemClickListener(item -> {
@@ -76,19 +78,19 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         fileSelectToolbar.getMenu()
                 .findItem(R.id.delete)
                 .setOnMenuItemClickListener(item -> {
-                    List<String> files = new ArrayList<>(selectedItems.size());
+                    List<String> filesToDelete = new ArrayList<>(selectedItems.size());
                     for (RemoteFile file : selectedItems) {
-                        files.add(file.getPath());
+                        filesToDelete.add(file.getPath());
                     }
                     StringBuilder sb = new StringBuilder();
                     sb.append(context.getString(R.string.que_ren_shan_chu_, selectedItems.size()));
                     if (selectedItems.size() < 4) {
-                        for (String file : files) {
+                        for (String file : filesToDelete) {
                             sb.append(file).append("\n");
                         }
                     } else {
                         for (int i = 0; i < 3; i++) {
-                            String file = files.get(i);
+                            String file = filesToDelete.get(i);
                             sb.append(file).append("\n");
                         }
                         sb.append("……");
@@ -106,7 +108,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
                                 progressDialog.setTitle(context.getString(R.string.shan_chu_zhong__));
                                 progressDialog.setMessage("");
                                 progressDialog.setProgressStyle(ProgressDialog.STYLE_HORIZONTAL);
-                                progressDialog.setMax(files.size());
+                                progressDialog.setMax(filesToDelete.size());
                                 progressDialog.show();
 
                                 new DeleteFilesTask(new DeleteFilesTask.EventHandler() {
@@ -136,7 +138,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
                                     public void onComplete() {
                                         refresh();
                                     }
-                                }, this, files).execute();
+                                }, this, filesToDelete).execute();
                             }).show();
                     return true;
                 });
@@ -155,7 +157,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         RemoteFile item = files.get(position);
         View itemView = holder.itemView;
         holder.fileName.setText(item.getName());
-        if (position == 0) {//..文件夹
+        if (position == 0) { // ".." parent folder
             itemView.setBackground(null);
             holder.fileIcon.setImageDrawable(context.getDrawable(R.drawable.folder));
             itemView.setOnClickListener(v -> {
@@ -252,16 +254,11 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
     protected void loading() {
         isLoading = true;
-        // 首先将视图的透明度设为 0（隐藏状态）
         loadingView.setAlpha(0f);
-        // 然后将视图设置为可见
         loadingView.setVisibility(View.VISIBLE);
-
-        // 使用 ViewPropertyAnimator 渐渐显示
         loadingView.animate()
-                .alpha(1f)  // 最终透明度为 1（完全显示）
-                .setDuration(1000);  // 动画持续时间，单位为毫秒
-
+                .alpha(1f)
+                .setDuration(1000);
         recyclerView.setVisibility(View.INVISIBLE);
     }
 
@@ -288,11 +285,8 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         }
         loading();
         DirPosition currentPosition = positions.get(positions.size() - 1);
-        //String dir = currentPosition.dir + name + "/";
-        //获取当前可见的第一个元素的位置
         currentPosition.position = linearLayoutManager.findFirstVisibleItemPosition();
 
-        System.out.println("cd " + dir);
         listFilesASync(dir, new ListFilesTask.CallBack() {
             @Override
             public void onResult(List<RemoteFile> files) {
@@ -330,7 +324,6 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
                 } else {
                     cancelLoading();
                     Toast.makeText(context, R.string.tiao_zhuan_shi_bai, Toast.LENGTH_SHORT).show();
-                    // If initial directory failed and panel has no loaded directory yet, fall back to root "/"
                     if (positions.isEmpty() && !"/".equals(dir)) {
                         jump("/");
                     }
@@ -383,7 +376,6 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         loading();
         DirPosition dirPosition = positions.get(positions.size() - 2);
         String dir = dirPosition.dir.path;
-        System.out.println("back " + dir);
         listFilesASync(dir, new ListFilesTask.CallBack() {
             @Override
             public void onResult(List<RemoteFile> files) {
@@ -393,7 +385,6 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
                         Toast.makeText(context, R.string.fu_mu_lu_wen_jian_shu_wei_kong, Toast.LENGTH_SHORT).show();
                     } else {
                         positions.removeLast();
-                        System.out.println(positions);
                         changeFiles(files);
                         linearLayoutManager.scrollToPositionWithOffset(dirPosition.position, 0);
                     }
@@ -415,11 +406,8 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
     protected abstract void handleListException(Throwable th);
 
-    protected abstract String getDefaultDir(HFXServer server);
+    protected abstract String getDefaultDir();
 
-    protected abstract int getFileSystem(HFXServer server);
-
-    //protected abstract void onDeleteFiles(List<String> files);
     public abstract boolean deleteFile(String file) throws RemoteException, IOException;
 
     public abstract void mkdir(String parent, String child);
@@ -427,7 +415,6 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
     private void listFilesASync(String path, ListFilesTask.CallBack callBack) {
         new ListFilesTask(callBack, path, this).execute();
     }
-
 
     public void setOnToTransferListener(OnConfirmFileSelectionListener onConfirmFileSelectionListener) {
         this.onConfirmFileSelectionListener = onConfirmFileSelectionListener;
@@ -442,9 +429,12 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
     @SuppressLint("NotifyDataSetChanged")
     public void selectAll() {
+        if (files.isEmpty()) {
+            return;
+        }
         selectedItems.clear();
         selectedItems.addAll(files);
-        selectedItems.remove(files.get(0));//排除”..“文件夹
+        selectedItems.remove(files.get(0));
         updateSelectedCount();
         notifyDataSetChanged();
     }
@@ -453,9 +443,9 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         return getCurrentDirectory().path;
     }
 
-    public Directory getCurrentDirectory(){
-        if (positions.isEmpty()){
-            return new Directory("/",fileSystem);
+    public Directory getCurrentDirectory() {
+        if (positions.isEmpty()) {
+            return new Directory("/", fileSystem);
         }
         return positions.get(positions.size() - 1).dir;
     }
@@ -471,16 +461,14 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         }
     }
 
-
     private LinkedList<DirPosition> createNewDirPositions(@NotNull Directory directory) {
-        LinkedList<DirPosition> positions = new LinkedList<>();
+        LinkedList<DirPosition> dirPositions = new LinkedList<>();
         while (directory != null) {
-            positions.add(new DirPosition(directory, 0));
+            dirPositions.add(new DirPosition(directory, 0));
             directory = directory.parent();
         }
-        Collections.reverse(positions);
-        System.out.println(positions);
-        return positions;
+        Collections.reverse(dirPositions);
+        return dirPositions;
     }
 
     private static class DirPosition {
@@ -490,14 +478,6 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         public DirPosition(Directory dir, int position) {
             this.dir = dir;
             this.position = position;
-        }
-
-        @Override
-        public String toString() {
-            return "DirPosition{" +
-                    "dir='" + dir + '\'' +
-                    ", position=" + position +
-                    '}';
         }
     }
 
@@ -509,7 +489,6 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
         String name = files.get(position).getName();
         return (name == null || name.isEmpty()) ? "" : String.valueOf(name.charAt(0));
     }
-
 
     public static class ViewHolder extends RecyclerView.ViewHolder {
         ImageView fileIcon;

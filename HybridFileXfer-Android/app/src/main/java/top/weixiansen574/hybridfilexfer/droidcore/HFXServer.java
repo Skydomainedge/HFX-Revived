@@ -2,6 +2,7 @@ package top.weixiansen574.hybridfilexfer.droidcore;
 
 import android.os.RemoteException;
 
+import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
@@ -20,12 +21,13 @@ import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.core.callback.ServerHandshakeCallback;
 import top.weixiansen574.hybridfilexfer.droidcore.callback.StartServerCallback;
 
+/**
+ * Android HFX v4 server implementation owned exclusively by {@code HfxEngineService}.
+ *
+ * <p>The legacy global static singleton has been permanently removed in M3 to decouple
+ * transport lifecycle from Android Activities.</p>
+ */
 public class HFXServer extends AbstractHFXServer {
-    /**
-     * Retained temporarily in M1 for legacy Activity compilation; will be removed in M3
-     * when {@code HfxEngineService} takes sole ownership of the server lifecycle.
-     */
-    public static HFXServer instance;
     protected final IIOService ioService;
 
     public HFXServer(IIOService ioService) {
@@ -90,6 +92,41 @@ public class HFXServer extends AbstractHFXServer {
 
     public boolean createLocalDir(String parent, String child) throws RemoteException {
         return ioService.appendAndMkdirs(parent, child);
+    }
+
+    @Override
+    protected List<RemoteFile> listLocalFilesForPeer(String path) throws Exception {
+        return listLocalFiles(path);
+    }
+
+    @Override
+    protected boolean createLocalDirForPeer(String parent, String child) throws Exception {
+        return createLocalDir(parent, child);
+    }
+
+    @Override
+    protected boolean deleteLocalFileForPeer(String path) throws Exception {
+        return deleteLocalFile(path);
+    }
+
+    @Override
+    protected RemoteFile resolveLocalFileForPeer(String path) throws Exception {
+        File f = new File(path);
+        if (f.exists()) {
+            return new RemoteFile(f);
+        }
+        File parent = f.getParentFile();
+        if (parent != null) {
+            List<RemoteFile> siblings = listLocalFiles(parent.getAbsolutePath());
+            if (siblings != null) {
+                for (RemoteFile rf : siblings) {
+                    if (path.equals(rf.getPath()) || f.getName().equals(rf.getName())) {
+                        return rf;
+                    }
+                }
+            }
+        }
+        return new RemoteFile(f);
     }
 
     public static List<RemoteFile> listLocalFiles(IIOService ioService, String path) throws RemoteException {

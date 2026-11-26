@@ -20,6 +20,7 @@ import java.util.Objects;
 
 import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcPayloads;
 
 public class TransferDialog {
     public final boolean isUpload;
@@ -65,7 +66,42 @@ public class TransferDialog {
     }
 
     public void showEvent(String iName, String event) {
-        Objects.requireNonNull(holderMap.get(iName)).transferEvent.setText(event);
+        Holder holder = holderMap.get(iName);
+        if (holder != null) {
+            holder.transferEvent.setText(event);
+        }
+    }
+
+    public void showProgress(IpcPayloads.TransferProgressPayload progress) {
+        if (progress == null) {
+            return;
+        }
+        if (progress.perRailBps != null) {
+            for (Map.Entry<String, Long> entry : progress.perRailBps.entrySet()) {
+                Holder holder = holderMap.get(entry.getKey());
+                if (holder != null) {
+                    String formatted = Utils.formatSpeed(entry.getValue() != null ? entry.getValue() : 0L);
+                    if (isUpload) {
+                        holder.uploadSpeed.setText(formatted);
+                    } else {
+                        holder.downloadSpeed.setText(formatted);
+                    }
+                }
+            }
+        }
+        if (progress.perRailCurrentFile != null) {
+            String arrow = isUpload ? "▲ " : "▼ ";
+            for (Map.Entry<String, String> entry : progress.perRailCurrentFile.entrySet()) {
+                showEvent(entry.getKey(), arrow + entry.getValue());
+            }
+        }
+        if (isUpload) {
+            dialog.setTitle(context.getString(R.string.uploading_speed,
+                    ((float) progress.aggregateBps) / 1024 / 1024));
+        } else {
+            dialog.setTitle(context.getString(R.string.downloading_speed,
+                    ((float) progress.aggregateBps) / 1024 / 1024));
+        }
     }
 
     public void showSpeeds(List<TrafficInfo> trafficInfoList) {

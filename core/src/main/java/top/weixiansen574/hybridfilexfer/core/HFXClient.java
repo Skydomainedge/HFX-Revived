@@ -8,6 +8,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
@@ -17,6 +18,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import top.weixiansen574.hybridfilexfer.core.bean.Directory;
@@ -24,6 +26,8 @@ import top.weixiansen574.hybridfilexfer.core.bean.RemoteFile;
 import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.core.callback.ClientCallBack;
 import top.weixiansen574.hybridfilexfer.core.callback.ConnectServerCallback;
+import top.weixiansen574.hybridfilexfer.core.callback.TransferFileCallback;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
 import top.weixiansen574.hybridfilexfer.core.protocol.DataChannelHandshake;
 import top.weixiansen574.hybridfilexfer.core.protocol.HmacAuth;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
@@ -42,6 +46,9 @@ public abstract class HFXClient extends HFXService {
     private byte[] pairSecret;
     private int requestedAdbStreams = 0; // 0 = accept server default; 1..8 = explicit request
     private int clientCapabilities = ProtocolConstants.ALL_V4_CAPS;
+    private volatile List<ServerNetInterface> negotiatedRails = Collections.emptyList();
+    private volatile List<InetAddress> resolvedBindAddresses = Collections.emptyList();
+    private final AtomicBoolean exitNotified = new AtomicBoolean(false);
 
     public HFXClient(String serverControllerAddress, int serverPort, String homeDir) {
         this.serverControllerAddress = serverControllerAddress;
@@ -59,6 +66,18 @@ public abstract class HFXClient extends HFXService {
         return clientId;
     }
 
+    public String getHomeDir() {
+        return homeDir;
+    }
+
+    public String getServerControllerAddress() {
+        return serverControllerAddress;
+    }
+
+    public int getServerPort() {
+        return serverPort;
+    }
+
     public void setPairSecret(byte[] pairSecret) {
         this.pairSecret = pairSecret;
     }
@@ -73,6 +92,27 @@ public abstract class HFXClient extends HFXService {
 
     public void setClientCapabilities(int capabilities) {
         this.clientCapabilities = capabilities;
+    }
+
+    @Override
+    public List<IpcDtos.RailStatusInfo> getRailStatusInfos(String state, String udcSpeed) {
+        List<IpcDtos.RailStatusInfo> base = super.getRailStatusInfos(state, udcSpeed);
+        List<ServerNetInterface> rails = this.negotiatedRails;
+        List<InetAddress> binds = this.resolvedBindAddresses;
+        for (IpcDtos.RailStatusInfo info : base) {
+            if (info.railId >= 0 && info.railId < rails.size()) {
+                ServerNetInterface sni = rails.get(info.railId);
+                if (sni.address != null) {
+                    info.address = sni.address.getHostAddress();
+                }
+                if (info.railId < binds.size() && binds.get(info.railId) != null) {
+                    info.bindAddress = binds.get(info.railId).getHostAddress();
+                } else if (sni.clientBindAddress != null) {
+                    info.bindAddress = sni.clientBindAddress.getHostAddress();
+                }
+            }
+        }
+        return base;
     }
 
     /**
@@ -170,13 +210,19 @@ public abstract class HFXClient extends HFXService {
             }
 
             // Connect all (railId, streamIdx) data channels concurrently
+            List<InetAddress> effectiveBinds = new ArrayList<>(rails.size());
+            for (ServerNetInterface rail : rails) {
+                effectiveBinds.add(resolveLocalBindAddress(rail));
+            }
             List<TransferConnection> established = connectDataChannelsParallel(
-                    rails, totalStreams, sessionToken, callback);
+                    rails, effectiveBinds, totalStreams, sessionToken, callback);
             if (established == null) {
                 closeQuietly(ctChannel);
                 return false;
             }
             connections = established;
+            negotiatedRails = Collections.unmodifiableList(rails);
+            resolvedBindAddresses = Collections.unmodifiableList(effectiveBinds);
 
             // Confirm data-channel phase with server
             ctChannel.writeBoolean(true);
@@ -235,12 +281,13 @@ public abstract class HFXClient extends HFXService {
 
     private List<TransferConnection> connectDataChannelsParallel(
             List<ServerNetInterface> rails,
+            List<InetAddress> effectiveBinds,
             int totalStreams,
             final byte[] sessionToken,
             final ConnectServerCallback callback) throws IOException {
-        for (ServerNetInterface rail : rails) {
-            InetAddress effectiveBind = resolveLocalBindAddress(rail);
-            callback.onConnectingTransferChannel(rail.name, rail.address, effectiveBind);
+        for (int i = 0; i < rails.size(); i++) {
+            ServerNetInterface rail = rails.get(i);
+            callback.onConnectingTransferChannel(rail.name, rail.address, effectiveBinds.get(i));
         }
 
         int poolSize = Math.min(totalStreams, 16);
@@ -253,7 +300,7 @@ public abstract class HFXClient extends HFXService {
         for (int railId = 0; railId < rails.size(); railId++) {
             final int rId = railId;
             final ServerNetInterface rail = rails.get(railId);
-            final InetAddress effectiveBind = resolveLocalBindAddress(rail);
+            final InetAddress effectiveBind = effectiveBinds.get(railId);
             for (int sIdx = 0; sIdx < rail.streamCount; sIdx++) {
                 final int streamIdx = sIdx;
                 futures.add(executor.submit(new Callable<TransferConnection>() {
@@ -324,8 +371,37 @@ public abstract class HFXClient extends HFXService {
         return result;
     }
 
+    /**
+     * Initiates a graceful shutdown towards the server, stops the control loop, and releases all resources.
+     */
+    public void disconnectGracefully() {
+        isRun = false;
+        cancelActiveTransfer();
+        if (ctChannel != null && ctChannel.isOpen()) {
+            try {
+                executeWithControlLock(new ControlAction<Void>() {
+                    @Override
+                    public Void run() throws IOException {
+                        try {
+                            ctChannel.writeShort(ControllerIdentifiers.SHUTDOWN);
+                        } catch (IOException ignored) {
+                        }
+                        return null;
+                    }
+                });
+            } catch (IOException ignored) {
+            }
+        }
+        stopControlLoop();
+        closeAllConnections();
+        closeQuietly(ctChannel);
+        freeBuffers();
+    }
+
     public void requestShutdown() {
         isRun = false;
+        cancelActiveTransfer();
+        stopControlLoop();
         closeAllConnections();
         closeQuietly(ctChannel);
         freeBuffers();
@@ -335,32 +411,181 @@ public abstract class HFXClient extends HFXService {
 
     public abstract long getAvailableMemoryMB();
 
-    public void start(ClientCallBack transferFileCallback) throws Exception {
-        this.callBack = transferFileCallback;
-        while (isRun) {
-            short id = ctChannel.readShort();
-            switch (id) {
-                case ControllerIdentifiers.LIST_FILES:
-                    handleListFiles();
-                    break;
-                case ControllerIdentifiers.DELETE_FILE:
-                    handleDeleteFile();
-                    break;
-                case ControllerIdentifiers.MKDIR:
-                    handleMkdir();
-                    break;
-                case ControllerIdentifiers.REQUEST_RECEIVE:
-                    handleReceiveFiles();
-                    break;
-                case ControllerIdentifiers.REQUEST_SEND:
-                    handleSendFiles();
-                    break;
-                case ControllerIdentifiers.SHUTDOWN:
-                    handleShutdown();
-                    break;
-                default:
-                    throw new IOException("Unknown controller command id: " + id);
+    // ---- Symmetric client-initiated peer RPCs (M3 headless PC control) ----
+
+    public List<RemoteFile> listRemoteFiles(final String path) throws IOException {
+        return executeWithControlLock(new ControlAction<List<RemoteFile>>() {
+            @Override
+            public List<RemoteFile> run() throws IOException {
+                ctChannel.writeShort(ControllerIdentifiers.LIST_FILES);
+                ctChannel.writeUTF(path != null ? path : "/");
+                int listSize = ctChannel.readInt();
+                if (listSize == -1) {
+                    return null;
+                }
+                ArrayList<RemoteFile> remoteFiles = new ArrayList<>(listSize);
+                for (int i = 0; i < listSize; i++) {
+                    remoteFiles.add(new RemoteFile(
+                            ctChannel.readUTF(),
+                            ctChannel.readUTF(),
+                            ctChannel.readLong(),
+                            ctChannel.readLong(),
+                            ctChannel.readBoolean()));
+                }
+                return remoteFiles;
             }
+        });
+    }
+
+    public boolean createRemoteDir(final String parent, final String child) throws IOException {
+        return executeWithControlLock(new ControlAction<Boolean>() {
+            @Override
+            public Boolean run() throws IOException {
+                ctChannel.writeShort(ControllerIdentifiers.MKDIR);
+                ctChannel.writeUTF(parent);
+                ctChannel.writeUTF(child);
+                return ctChannel.readBoolean();
+            }
+        });
+    }
+
+    public boolean deleteRemoteFile(final String path) throws IOException {
+        return executeWithControlLock(new ControlAction<Boolean>() {
+            @Override
+            public Boolean run() throws IOException {
+                ctChannel.writeShort(ControllerIdentifiers.DELETE_FILE);
+                ctChannel.writeUTF(path);
+                return ctChannel.readBoolean();
+            }
+        });
+    }
+
+    /**
+     * Uploads local files from PC client to the remote server.
+     */
+    public boolean sendFilesToRemote(final List<RemoteFile> files,
+                                     final Directory localDir,
+                                     final Directory remoteDir,
+                                     final TransferFileCallback callback) throws IOException {
+        return executeWithControlLock(new ControlAction<Boolean>() {
+            @Override
+            public Boolean run() throws IOException {
+                ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);
+                return sendFiles(files, localDir, remoteDir, callback);
+            }
+        });
+    }
+
+    /**
+     * Downloads remote files from the server to local PC client directory.
+     */
+    public boolean sendFilesToShelf(final List<RemoteFile> remoteFiles,
+                                    final Directory localDestDir,
+                                    final Directory remoteSrcDir,
+                                    final TransferFileCallback callback) throws IOException {
+        return executeWithControlLock(new ControlAction<Boolean>() {
+            @Override
+            public Boolean run() throws IOException {
+                ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
+                ctChannel.writeInt(remoteFiles.size());
+                for (RemoteFile file : remoteFiles) {
+                    ctChannel.writeUTF(file.getPath());
+                }
+                ctChannel.writeUTF(localDestDir.path);
+                ctChannel.writeInt(localDestDir.fileSystem);
+                ctChannel.writeUTF(remoteSrcDir.path);
+                return receiveFiles(callback);
+            }
+        });
+    }
+
+    // ---- Local filesystem helpers exposed to PC engine runtime ----
+
+    public List<RemoteFile> listLocalFilesWithRoots(String path) throws Exception {
+        if (path != null && !path.isEmpty() && !"/".equals(path)) {
+            if (Directory.getCurrentFileSystem() == Directory.FILE_SYSTEM_WINDOWS
+                    && path.length() == 2 && Character.isLetter(path.charAt(0)) && path.charAt(1) == ':') {
+                path = path + "\\";
+            }
+            return listFiles(path);
+        }
+        File[] roots = File.listRoots();
+        if (roots == null) {
+            return null;
+        }
+        if (roots.length == 1 && "/".equals(roots[0].getAbsolutePath())) {
+            return listFiles(roots[0].getPath());
+        }
+        List<RemoteFile> entries = new ArrayList<>(roots.length);
+        for (File root : roots) {
+            entries.add(new RemoteFile(root.getPath(), root.getPath(), root.lastModified(), root.length(), root.isDirectory()));
+        }
+        return entries;
+    }
+
+    public boolean createLocalDirectory(String parent, String child) throws Exception {
+        return mkdir(parent, child);
+    }
+
+    public boolean deleteLocalPath(String path) throws Exception {
+        return deleteLocalFile(path);
+    }
+
+    public void start(ClientCallBack transferFileCallback) throws Exception {
+        start(transferFileCallback, null);
+    }
+
+    public void start(ClientCallBack transferFileCallback, Runnable onLoopStarted) throws Exception {
+        this.callBack = transferFileCallback != null ? transferFileCallback : NO_OP_CALLBACK;
+        final AtomicReference<Throwable> loopError = new AtomicReference<>(null);
+        runPausableControlLoop(new ControlCommandHandler() {
+            @Override
+            public boolean handleCommand(short id) throws Exception {
+                if (!isRun) {
+                    return false;
+                }
+                switch (id) {
+                    case ControllerIdentifiers.LIST_FILES:
+                        handleListFiles();
+                        return isRun;
+                    case ControllerIdentifiers.DELETE_FILE:
+                        handleDeleteFile();
+                        return isRun;
+                    case ControllerIdentifiers.MKDIR:
+                        handleMkdir();
+                        return isRun;
+                    case ControllerIdentifiers.REQUEST_RECEIVE:
+                        handleReceiveFiles();
+                        return isRun;
+                    case ControllerIdentifiers.REQUEST_SEND:
+                        handleSendFiles();
+                        return isRun;
+                    case ControllerIdentifiers.SHUTDOWN:
+                        handleShutdown();
+                        return false;
+                    default:
+                        throw new IOException("Unknown controller command id: " + id);
+                }
+            }
+
+            @Override
+            public void onLoopExit(Throwable error) {
+                loopError.set(error);
+                isRun = false;
+                closeQuietly(ctChannel);
+                closeAllConnections();
+                freeBuffers();
+                if (error == null && callBack != null && exitNotified.compareAndSet(false, true)) {
+                    callBack.onExit();
+                }
+            }
+        }, onLoopStarted);
+        Throwable err = loopError.get();
+        if (err != null) {
+            if (err instanceof Exception) {
+                throw (Exception) err;
+            }
+            throw new IOException("Control loop error", err);
         }
     }
 
@@ -383,51 +608,21 @@ public abstract class HFXClient extends HFXService {
         closeQuietly(ctChannel);
         closeAllConnections();
         freeBuffers();
-        if (callBack != null) {
+        if (callBack != null && exitNotified.compareAndSet(false, true)) {
             callBack.onExit();
         }
     }
 
     private void handleListFiles() throws Exception {
         String path = ctChannel.readUTF();
-        if (path != null && !"/".equals(path)) {
-            if (Directory.getCurrentFileSystem() == Directory.FILE_SYSTEM_WINDOWS
-                    && path.length() == 2 && Character.isLetter(path.charAt(0)) && path.charAt(1) == ':') {
-                path = path + "\\";
-            }
-            List<RemoteFile> files = listFiles(path);
-            if (files != null) {
-                ctChannel.writeInt(files.size());
-                for (RemoteFile file : files) {
-                    writeFile(file);
-                }
-            } else {
-                ctChannel.writeInt(-1);
+        List<RemoteFile> files = listLocalFilesWithRoots(path);
+        if (files != null) {
+            ctChannel.writeInt(files.size());
+            for (RemoteFile file : files) {
+                writeFile(file);
             }
         } else {
-            File[] roots = File.listRoots();
-            if (roots != null && roots.length == 1 && "/".equals(roots[0].getAbsolutePath())) {
-                List<RemoteFile> files = listFiles(roots[0].getPath());
-                if (files == null) {
-                    ctChannel.writeInt(-1);
-                    return;
-                }
-                ctChannel.writeInt(files.size());
-                for (RemoteFile file : files) {
-                    writeFile(file);
-                }
-            } else if (roots != null) {
-                ctChannel.writeInt(roots.length);
-                for (File file : roots) {
-                    ctChannel.writeUTF(file.getPath());
-                    ctChannel.writeUTF(file.getPath());
-                    ctChannel.writeLong(file.lastModified());
-                    ctChannel.writeLong(file.length());
-                    ctChannel.writeBoolean(file.isDirectory());
-                }
-            } else {
-                ctChannel.writeInt(-1);
-            }
+            ctChannel.writeInt(-1);
         }
     }
 
@@ -442,7 +637,9 @@ public abstract class HFXClient extends HFXService {
     }
 
     private void handleReceiveFiles() throws IOException {
-        callBack.onReceiving();
+        if (callBack != null) {
+            callBack.onReceiving();
+        }
         isRun = receiveFiles(callBack);
     }
 
@@ -454,7 +651,9 @@ public abstract class HFXClient extends HFXService {
         }
         Directory remoteDir = new Directory(ctChannel.readUTF(), ctChannel.readInt());
         Directory localDir = new Directory(ctChannel.readUTF(), Directory.getCurrentFileSystem());
-        callBack.onSending();
+        if (callBack != null) {
+            callBack.onSending();
+        }
         isRun = sendFiles(fileList, localDir, remoteDir, callBack);
     }
 
@@ -481,4 +680,19 @@ public abstract class HFXClient extends HFXService {
     protected void freeBuffers() {
         buffers.clear();
     }
+
+    private static final ClientCallBack NO_OP_CALLBACK = new ClientCallBack() {
+        @Override public void onReceiving() {}
+        @Override public void onSending() {}
+        @Override public void onExit() {}
+        @Override public void onFileUploading(String iName, String path, long targetSize, long totalSize) {}
+        @Override public void onFileDownloading(String iName, String path, long targetSize, long totalSize) {}
+        @Override public void onSpeedInfo(List<top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo> trafficInfoList) {}
+        @Override public void onChannelComplete(String iName, long traffic, long time) {}
+        @Override public void onChannelError(String iName, int errorType, String message) {}
+        @Override public void onReadFileError(String message) {}
+        @Override public void onWriteFileError(String message) {}
+        @Override public void onComplete(boolean isUpload, long traffic, long time) {}
+        @Override public void onIncomplete() {}
+    };
 }

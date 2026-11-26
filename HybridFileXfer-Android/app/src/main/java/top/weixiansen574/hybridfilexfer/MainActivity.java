@@ -3,7 +3,6 @@ package top.weixiansen574.hybridfilexfer;
 import android.Manifest;
 import android.app.ActivityManager;
 import android.app.AlertDialog;
-import android.app.Service;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.DialogInterface;
@@ -15,6 +14,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.IBinder;
+import android.os.RemoteException;
 import android.provider.Settings;
 import android.text.TextUtils;
 import android.view.Menu;
@@ -27,39 +27,53 @@ import android.widget.Spinner;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
-import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
-import java.io.IOException;
-import java.net.SocketException;
-import java.net.UnknownHostException;
 import java.util.List;
 
 import rikka.shizuku.Shizuku;
-import top.weixiansen574.async.BackstageTask;
-import top.weixiansen574.hybridfilexfer.aidl.IIOService;
-import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
-import top.weixiansen574.hybridfilexfer.droidcore.HFXServer;
-import top.weixiansen574.hybridfilexfer.droidcore.StartServerTask;
-import top.weixiansen574.hybridfilexfer.droidcore.callback.StartServerCallback;
+import top.weixiansen574.hybridfilexfer.aidl.IHfxEngine;
+import top.weixiansen574.hybridfilexfer.aidl.IHfxEngineCallback;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcEvents;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcJson;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcPayloads;
+import top.weixiansen574.hybridfilexfer.core.ipc.SessionState;
+import top.weixiansen574.hybridfilexfer.engine.HfxEngineService;
 import top.weixiansen574.hybridfilexfer.listadapter.NetCardsAdapter;
 
+/**
+ * Thin display-layer shell binding to headless {@link HfxEngineService} via {@link IHfxEngine}.
+ *
+ * <p>Holds zero {@code HFXServer} or {@code IIOService} references; destroying or rotating this
+ * Activity only unbinds the UI observer and never tears down an active background connection or transfer.</p>
+ */
 public class MainActivity extends AppCompatActivity implements View.OnClickListener, ServiceConnection {
     public static final int REQUEST_CODE_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION = 1;
-    public static final int REQUEST_CODE_TRANSFER = 2;
-    public static final int RESULT_CODE_SERVER_DISCONNECT = 1;
+    public static final int REQUEST_CODE_NOTIFICATION_PERMISSION = 3;
+
     private NetCardsAdapter netCardsAdapter;
     private Spinner spinnerMode;
-    Button startServerBtn;
-    Button toTransfer;
-    Context context;
-    private boolean isShizuku = false;
-    private HFXServer server;
+    private Button startServerBtn;
+    private Button toTransfer;
+    private Context context;
     private Config config;
+
+    private IHfxEngine engine;
+    private boolean engineBound = false;
+    private SessionState currentState = SessionState.IDLE;
+    private IpcPayloads.RailConflictResolvedPayload lastConflict;
+
+    private final IHfxEngineCallback engineCallback = new IHfxEngineCallback.Stub() {
+        @Override
+        public void onEvent(final String eventName, final String payloadJson) {
+            runOnUiThread(() -> handleEngineEvent(eventName, payloadJson));
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -79,16 +93,10 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         layoutManager.setOrientation(RecyclerView.VERTICAL);
         recyclerView.setLayoutManager(layoutManager);
 
-        try {
-            netCardsAdapter = new NetCardsAdapter(this);
-            recyclerView.setAdapter(netCardsAdapter);
-        } catch (IOException e) {
-            Toast.makeText(this, e.getMessage(), Toast.LENGTH_SHORT).show();
-            startServerBtn.setEnabled(false);
-        }
+        netCardsAdapter = new NetCardsAdapter(this);
+        recyclerView.setAdapter(netCardsAdapter);
 
         spinnerMode.setSelection(config.getMode());
-
         spinnerMode.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override
             public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
@@ -97,45 +105,188 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
 
             @Override
             public void onNothingSelected(AdapterView<?> parent) {
-
             }
         });
+
+        requestNotificationPermissionIfNeeded();
+        bindEngineService();
+    }
+
+    private void requestNotificationPermissionIfNeeded() {
+        if (Build.VERSION.SDK_INT >= 33) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                    != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                        this,
+                        new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                        REQUEST_CODE_NOTIFICATION_PERMISSION);
+            }
+        }
+    }
+
+    private void bindEngineService() {
+        Intent intent = new Intent(this, HfxEngineService.class);
+        engineBound = bindService(intent, this, Context.BIND_AUTO_CREATE);
+    }
+
+    @Override
+    public void onServiceConnected(ComponentName name, IBinder service) {
+        engine = IHfxEngine.Stub.asInterface(service);
+        try {
+            engine.registerCallback(engineCallback);
+        } catch (RemoteException ignored) {
+        }
+        syncFromEngineSnapshot();
+    }
+
+    @Override
+    public void onServiceDisconnected(ComponentName name) {
+        engine = null;
+    }
+
+    private void syncFromEngineSnapshot() {
+        IHfxEngine eng = this.engine;
+        if (eng == null) {
+            return;
+        }
+        new Thread(() -> {
+            try {
+                IpcDtos.EngineSnapshot snap = EngineIpcHelper.unwrap(
+                        eng.getSnapshotJson(), IpcDtos.EngineSnapshot.class);
+                if (snap == null) {
+                    return;
+                }
+                if (snap.state == SessionState.IDLE && (snap.nics == null || snap.nics.isEmpty())) {
+                    IpcPayloads.NicsRefreshResult refreshed = EngineIpcHelper.unwrap(
+                            eng.refreshNicsJson(), IpcPayloads.NicsRefreshResult.class);
+                    if (refreshed != null) {
+                        snap.nics = refreshed.nics;
+                        snap.udcSpeed = refreshed.udcSpeed;
+                        lastConflict = refreshed.conflictResolved;
+                    }
+                }
+                final IpcDtos.EngineSnapshot finalSnap = snap;
+                runOnUiThread(() -> {
+                    netCardsAdapter.updateFromNics(
+                            finalSnap.nics, finalSnap.udcSpeed, lastConflict, finalSnap.rails);
+                    applySessionStateUi(finalSnap.state);
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(context, e.getMessage(), Toast.LENGTH_SHORT).show());
+            }
+        }).start();
+    }
+
+    private void handleEngineEvent(String eventName, String payloadJson) {
+        if (isFinishing() || isDestroyed()) {
+            return;
+        }
+        if (IpcEvents.SESSION_STATE_CHANGED.equals(eventName)) {
+            IpcPayloads.SessionStateChangedPayload sc = IpcJson.fromJson(
+                    payloadJson, IpcPayloads.SessionStateChangedPayload.class);
+            if (sc != null && sc.current != null) {
+                applySessionStateUi(sc.current);
+                if (sc.prev == SessionState.IDLE && sc.current == SessionState.DISCOVERING) {
+                    Toast.makeText(context, R.string.fu_wu_yi_qi_dong, Toast.LENGTH_SHORT).show();
+                } else if (sc.current == SessionState.IDLE && sc.prev != SessionState.IDLE) {
+                    Toast.makeText(context, R.string.fu_wu_yi_ting_zhi, Toast.LENGTH_SHORT).show();
+                }
+            }
+        } else if (IpcEvents.RAIL_STATUS.equals(eventName)) {
+            IpcPayloads.RailStatusPayload rp = IpcJson.fromJson(payloadJson, IpcPayloads.RailStatusPayload.class);
+            if (rp != null) {
+                netCardsAdapter.applyRailStatuses(rp.rails);
+            }
+        } else if (IpcEvents.RAIL_CONFLICT_RESOLVED.equals(eventName)) {
+            lastConflict = IpcJson.fromJson(payloadJson, IpcPayloads.RailConflictResolvedPayload.class);
+        } else if (IpcEvents.DIAGNOSTIC_WARNING.equals(eventName)) {
+            IpcPayloads.DiagnosticWarningPayload warn = IpcJson.fromJson(
+                    payloadJson, IpcPayloads.DiagnosticWarningPayload.class);
+            if (warn != null && warn.code != null) {
+                if ("BIND_FAILED".equals(warn.code)) {
+                    Toast.makeText(context, getString(R.string.service_start_failed, config.getServerPort()),
+                            Toast.LENGTH_SHORT).show();
+                } else if ("REMOTE_OOM".equals(warn.code)) {
+                    Toast.makeText(context, R.string.dui_fang_nei_cun_bu_zu, Toast.LENGTH_LONG).show();
+                } else if ("LOCAL_OOM".equals(warn.code)) {
+                    Toast.makeText(context, warn.message, Toast.LENGTH_LONG).show();
+                }
+            }
+        }
+    }
+
+    private void applySessionStateUi(SessionState state) {
+        this.currentState = state;
+        boolean idle = (state == SessionState.IDLE || state == SessionState.ERROR);
+        boolean connected = (state == SessionState.CONNECTED || state == SessionState.TRANSFERRING);
+
+        netCardsAdapter.setEnableModify(idle);
+        startServerBtn.setEnabled(true);
+        toTransfer.setEnabled(connected);
+
+        if (idle) {
+            startServerBtn.setText(R.string.qi_dong_fu_wu_qi_bing_deng_dai_lian_jie);
+        } else if (connected) {
+            startServerBtn.setText(R.string.duan_kai_lian_jie);
+        } else {
+            startServerBtn.setText(R.string.ting_zhi_fu_wu);
+        }
     }
 
     @Override
     public void onClick(View v) {
         int id = v.getId();
         if (id == R.id.start_server) {
-            if (server == null) {
+            if (currentState == SessionState.IDLE || currentState == SessionState.ERROR) {
                 startServer();
             } else {
-                disconnect(true);
+                stopOrDisconnectServer();
             }
         } else if (id == R.id.to_transfer) {
-            startActivityForResult(new Intent(context, TransferActivity.class), REQUEST_CODE_TRANSFER);
+            startActivity(new Intent(context, TransferActivity.class));
         } else if (id == R.id.refresh) {
-            if (server == null) {
-                try {
-                    netCardsAdapter.reload();
-                } catch (SocketException | UnknownHostException e) {
-                    Toast.makeText(context, e.getMessage(), Toast.LENGTH_SHORT).show();
-                }
+            if (currentState == SessionState.IDLE || currentState == SessionState.ERROR) {
+                refreshNics();
             } else {
                 Toast.makeText(context, R.string.qing_xian_ting_zhi_fu_wu_duan, Toast.LENGTH_SHORT).show();
             }
         }
     }
 
+    private void refreshNics() {
+        IHfxEngine eng = this.engine;
+        if (eng == null) {
+            return;
+        }
+        new Thread(() -> {
+            try {
+                IpcPayloads.NicsRefreshResult res = EngineIpcHelper.unwrap(
+                        eng.refreshNicsJson(), IpcPayloads.NicsRefreshResult.class);
+                if (res != null) {
+                    lastConflict = res.conflictResolved;
+                    runOnUiThread(() -> netCardsAdapter.updateFromNics(
+                            res.nics, res.udcSpeed, res.conflictResolved, null));
+                }
+            } catch (Exception e) {
+                runOnUiThread(() -> Toast.makeText(context, e.getMessage(), Toast.LENGTH_SHORT).show());
+            }
+        }).start();
+    }
+
     public void startServer() {
+        if (engine == null) {
+            Toast.makeText(context, R.string.fu_wu_wei_yun_xing, Toast.LENGTH_SHORT).show();
+            return;
+        }
         if (checkPermissionOrRequest()) {
             Toast.makeText(context, R.string.xu_yao_wen_jian_du_xie_quan_xian, Toast.LENGTH_LONG).show();
             return;
         }
-        List<ServerNetInterface> selectedInterfaces = netCardsAdapter.getSelectedInterfaces();
-        if (selectedInterfaces == null) {
+        List<IpcDtos.RailSelection> selectedRails = netCardsAdapter.getSelectedRailSelections();
+        if (selectedRails == null) {
             return;
         }
-        if (selectedInterfaces.isEmpty()) {
+        if (selectedRails.isEmpty()) {
             Toast.makeText(context, R.string.mei_you_wang_ka_xuan_ze, Toast.LENGTH_SHORT).show();
             return;
         }
@@ -145,142 +296,69 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             return;
         }
 
-        if (spinnerMode.getSelectedItemPosition() == 0) {
-            isShizuku = false;
-        } else {
-            if (checkShizukuOrReq(spinnerMode.getSelectedItemPosition())) {
-                return;
-            }
-            isShizuku = true;
+        int ioMode = spinnerMode.getSelectedItemPosition();
+        if (ioMode != 0 && checkShizukuOrReq(ioMode)) {
+            return;
         }
-        bindAndStartService();
-    }
 
-    private void bindAndStartService() {
-        netCardsAdapter.setEnableModify(false);
+        final IpcPayloads.ServerStartParams params = new IpcPayloads.ServerStartParams();
+        params.port = config.getServerPort();
+        params.ioMode = ioMode;
+        params.selectedRails = selectedRails;
+        params.localBufferCount = config.getLocalBufferCount();
+        params.remoteBufferCount = config.getRemoteBufferCount();
+
         startServerBtn.setEnabled(false);
+        netCardsAdapter.setEnableModify(false);
         startServerBtn.setText(R.string.ting_zhi_fu_wu);
-        if (isShizuku) {
-            Shizuku.bindUserService(IOService.getUserServiceArgs(context), this);
-        } else {
-            Intent intent = new Intent(context, IOService.class);
-            bindService(intent, this, Service.BIND_AUTO_CREATE);
+
+        final IHfxEngine eng = this.engine;
+        new Thread(() -> {
+            try {
+                EngineIpcHelper.unwrap(eng.startServer(IpcJson.toJson(params)), IpcPayloads.OkResult.class);
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    Toast.makeText(context, e.getMessage(), Toast.LENGTH_SHORT).show();
+                    applySessionStateUi(SessionState.IDLE);
+                });
+            }
+        }).start();
+    }
+
+    private void stopOrDisconnectServer() {
+        final IHfxEngine eng = this.engine;
+        if (eng == null) {
+            return;
         }
-    }
-
-    private void unbindService() {
-        if (isShizuku) {
-            Shizuku.unbindUserService(IOService.getUserServiceArgs(context), this, true);
-        } else {
-            unbindService(this);
-        }
-    }
-
-    @Override
-    public void onServiceConnected(ComponentName name, IBinder service) {
-        IIOService iioService = IIOService.Stub.asInterface(service);
-        server = new HFXServer(iioService);
-        StartServerCallback callback = new StartServerCallback() {
-            @Override
-            public void onBindFailed(int port) {
-                Toast.makeText(context, getString(R.string.service_start_failed, port), Toast.LENGTH_SHORT).show();
-                netCardsAdapter.setEnableModify(true);
-                startServerBtn.setEnabled(true);
-                startServerBtn.setText(R.string.qi_dong_fu_wu_qi_bing_deng_dai_lian_jie);
-                server = null;
+        startServerBtn.setEnabled(false);
+        new Thread(() -> {
+            try {
+                eng.stopServer();
+            } catch (Exception ignored) {
             }
-
-            @Override
-            public void onStatedServer() {
-                startServerBtn.setEnabled(true);
-                Toast.makeText(context, R.string.fu_wu_yi_qi_dong, Toast.LENGTH_SHORT).show();
-                for (ServerNetInterface selectedInterface : netCardsAdapter.getSelectedInterfaces()) {
-                    netCardsAdapter.changeItemState(selectedInterface.name, getString(R.string.deng_dai_lian_jie));
-                }
-            }
-
-            @Override
-            public void onAccepted(String name) {
-                netCardsAdapter.changeItemState(name, getString(R.string.yi_lian_jie));
-            }
-
-            @Override
-            public void onAcceptFailed(String name) {
-                netCardsAdapter.changeItemState(name, getString(R.string.lian_jie_shi_bai));
-            }
-
-            @Override
-            public void onPcOOM() {
-                Toast.makeText(context, R.string.dui_fang_nei_cun_bu_zu, Toast.LENGTH_LONG).show();
-                changeToStartState();
-            }
-
-            @Override
-            public void onMeOOM(int created, int localBufferCount) {
-                Toast.makeText(context, getString(R.string.buffer_block_creation_failed_toast,
-                        created, localBufferCount), Toast.LENGTH_LONG).show();
-                changeToStartState();
-            }
-
-            @Override
-            public void onConnectSuccess() {
-                toTransfer.setEnabled(true);
-                //设置静态实例，使得传输Activity能使用
-                HFXServer.instance = server;
-                //TODO 国际化
-                startServerBtn.setText(R.string.duan_kai_lian_jie);
-            }
-
-            @Override
-            public void onError(Throwable th) {
-                Toast.makeText(context, R.string.fu_wu_yi_ting_zhi, Toast.LENGTH_SHORT).show();
-                changeToStartState();
-            }
-        };
-        new StartServerTask(callback,server,config.getServerPort(), netCardsAdapter.getSelectedInterfaces(),
-                config.getLocalBufferCount(), config.getRemoteBufferCount()).execute();
-    }
-
-    @Override
-    public void onServiceDisconnected(ComponentName name) {
-        System.out.println("onServiceDisconnected");
+            runOnUiThread(() -> applySessionStateUi(SessionState.IDLE));
+        }).start();
     }
 
     private boolean checkPermissionOrRequest() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // 检查是否有所有文件访问权限
             if (Environment.isExternalStorageManager()) {
-                // 已经获得文件访问权限
                 return false;
             } else {
-                // 请求文件访问权限
                 Intent intent = new Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
-                //添加包名，不然要在设置中翻列表
                 intent.setData(Uri.parse("package:" + context.getPackageName()));
                 startActivityForResult(intent, REQUEST_CODE_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION);
                 return true;
             }
         } else {
-            // 检查是否有存储权限
-            if (ContextCompat.checkSelfPermission(this, android.Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED) {
-                // 已经获得存储权限
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                    == PackageManager.PERMISSION_GRANTED) {
                 return false;
             } else {
-                // 请求存储权限
                 ActivityCompat.requestPermissions(this, new String[]{
-                        android.Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                        Manifest.permission.WRITE_EXTERNAL_STORAGE,
                         Manifest.permission.READ_EXTERNAL_STORAGE}, 0);
                 return true;
-            }
-        }
-    }
-
-    @Override
-    protected void onActivityResult(int requestCode, int resultCode, @Nullable Intent data) {
-        super.onActivityResult(requestCode, resultCode, data);
-        if (requestCode == REQUEST_CODE_TRANSFER) {
-            if (resultCode == RESULT_CODE_SERVER_DISCONNECT) {
-                disconnect(false);
             }
         }
     }
@@ -319,7 +397,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             EditText editRemoteCount = view.findViewById(R.id.edit_remote_buffer_count);
             editLocalCount.setText(String.valueOf(config.getLocalBufferCount()));
             editRemoteCount.setText(String.valueOf(config.getRemoteBufferCount()));
-            editLocalCount.setHint(getString(R.string.dang_qian_zui_gao_ke_she_zhi,getAvailableMemoryMB()));
+            editLocalCount.setHint(getString(R.string.dang_qian_zui_gao_ke_she_zhi, getAvailableMemoryMB()));
 
             AlertDialog dialog = new AlertDialog.Builder(context)
                     .setTitle(R.string.she_zhi_huan_chong_qu_kuai_shu)
@@ -333,12 +411,9 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 positiveButton.setOnClickListener(v -> {
                     String localCountStr = editLocalCount.getText().toString();
                     String remoteCountStr = editRemoteCount.getText().toString();
-
-                    // 清除之前的错误提示
                     editLocalCount.setError(null);
                     editRemoteCount.setError(null);
 
-                    // 校验是否为空
                     if (localCountStr.isEmpty()) {
                         editLocalCount.setError(getString(R.string.huan_chong_qu_kuai_shu_bu_neng_wei_kong));
                         return;
@@ -350,8 +425,6 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
 
                     int localCount = Integer.parseInt(localCountStr);
                     int remoteCount = Integer.parseInt(remoteCountStr);
-
-                    // 校验是否大于 16
                     if (localCount <= 16) {
                         editLocalCount.setError(getString(R.string.zui_xiao_ke_she_zhi_16));
                         return;
@@ -366,17 +439,14 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                     dialog.dismiss();
                 });
             });
-
             dialog.show();
         } else if (itemId == R.id.client) {
             startClient();
         }
-
         return super.onOptionsItemSelected(item);
     }
 
     private void startClient() {
-        //客户端一样要申请存储权限
         if (checkPermissionOrRequest()) {
             return;
         }
@@ -405,15 +475,13 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 return;
             }
             int mode = spinner.getSelectedItemPosition();
-            if (mode != 0) {
-                if (checkShizukuOrReq(mode)) {
-                    return;
-                }
+            if (mode != 0 && checkShizukuOrReq(mode)) {
+                return;
             }
             config.setConnectServerControllerIp(ip);
             config.setClientIOMode(mode);
             Intent intent = new Intent(context, ClientActivity.class);
-            intent.putExtra("io_mode", spinner.getSelectedItemPosition());
+            intent.putExtra("io_mode", mode);
             intent.putExtra("controller_ip", ip);
             intent.putExtra("home_dir", editMainDir.getText().toString());
             startActivity(intent);
@@ -425,38 +493,30 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         if (!Shizuku.pingBinder()) {
             showInstallShizukuDialog(context);
             return true;
-        } else {
-            if (Shizuku.checkSelfPermission() != 0) {
-                Toast.makeText(context, R.string.wei_shou_quan_sui_ti_shi, Toast.LENGTH_SHORT).show();
-                Shizuku.requestPermission(1);
-                return true;
-            }
+        } else if (Shizuku.checkSelfPermission() != 0) {
+            Toast.makeText(context, R.string.wei_shou_quan_sui_ti_shi, Toast.LENGTH_SHORT).show();
+            Shizuku.requestPermission(1);
+            return true;
         }
-        System.out.println("Shizuku UID:" + Shizuku.getUid());
-        if (mode == 1) {
-            if (Shizuku.getUid() != 0) {
-                new AlertDialog.Builder(context)
-                        .setTitle(R.string.shizuku_startup_method_are_inconsistent_title)
-                        .setMessage(R.string.shizuku_startup_method_are_inconsistent_message_root)
-                        .setPositiveButton(R.string.ok, null)
-                        .show();
-                return true;
-            }
-        } else if (mode == 2) {
-            if (Shizuku.getUid() != 2000) {
-                new AlertDialog.Builder(context)
-                        .setTitle(R.string.shizuku_startup_method_are_inconsistent_title)
-                        .setMessage(R.string.shizuku_startup_method_are_inconsistent_message_adb)
-                        .setPositiveButton(R.string.ok, null)
-                        .show();
-                return true;
-            }
+        if (mode == 1 && Shizuku.getUid() != 0) {
+            new AlertDialog.Builder(context)
+                    .setTitle(R.string.shizuku_startup_method_are_inconsistent_title)
+                    .setMessage(R.string.shizuku_startup_method_are_inconsistent_message_root)
+                    .setPositiveButton(R.string.ok, null)
+                    .show();
+            return true;
+        } else if (mode == 2 && Shizuku.getUid() != 2000) {
+            new AlertDialog.Builder(context)
+                    .setTitle(R.string.shizuku_startup_method_are_inconsistent_title)
+                    .setMessage(R.string.shizuku_startup_method_are_inconsistent_message_adb)
+                    .setPositiveButton(R.string.ok, null)
+                    .show();
+            return true;
         }
         return false;
     }
 
     public void showInstallShizukuDialog(Context context) {
-        // 创建对话框
         new AlertDialog.Builder(context)
                 .setTitle(R.string.shizuku_not_running)
                 .setMessage(R.string.shizuku_not_running_message)
@@ -474,57 +534,31 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 .show();
     }
 
-    private void changeToStartState() {
-        netCardsAdapter.setEnableModify(true);
-        startServerBtn.setEnabled(true);
-        startServerBtn.setText(R.string.qi_dong_fu_wu_qi_bing_deng_dai_lian_jie);
-        server = null;
-        unbindService();
-    }
-
-    private void disconnect(boolean toast) {
-        startServerBtn.setEnabled(false);
-        if (HFXServer.instance == null) {
-            server.closeServerSocket();
-        } else {
-            server.disconnect(new BackstageTask.BaseEventHandler() {
-                @Override
-                public void onComplete() {
-                    if (toast) {
-                        Toast.makeText(context, R.string.fu_wu_yi_guan_bi, Toast.LENGTH_SHORT).show();
-                    }
-                    unbindService();
-                    netCardsAdapter.setEnableModify(true);
-                    toTransfer.setEnabled(false);
-                    startServerBtn.setText(R.string.qi_dong_fu_wu_qi_bing_deng_dai_lian_jie);
-                    startServerBtn.setEnabled(true);
-                    HFXServer.instance = null;
-                    server = null;
-                }
-            });
-        }
-    }
-
     private long getAvailableMemoryMB() {
         ActivityManager activityManager = context.getSystemService(ActivityManager.class);
         ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
         activityManager.getMemoryInfo(memoryInfo);
-
-        long totalMemory = memoryInfo.totalMem;
-
-        long availableMemory = memoryInfo.availMem;
-
-        long totalMemoryMB = totalMemory / (1024 * 1024);
-        long availableMemoryMB = availableMemory / (1024 * 1024);
-
+        long totalMemoryMB = memoryInfo.totalMem / (1024 * 1024);
+        long availableMemoryMB = memoryInfo.availMem / (1024 * 1024);
         return (long) (availableMemoryMB - (totalMemoryMB * 0.05));
     }
 
     @Override
     protected void onDestroy() {
-        if (HFXServer.instance != null) {
-            HFXServer.instance.disconnect(new BackstageTask.BaseEventHandler() {
-            });
+        // Only unbind UI observer; background HfxEngineService keeps connection & transfer alive!
+        if (engine != null) {
+            try {
+                engine.unregisterCallback(engineCallback);
+            } catch (RemoteException ignored) {
+            }
+            engine = null;
+        }
+        if (engineBound) {
+            try {
+                unbindService(this);
+            } catch (IllegalArgumentException ignored) {
+            }
+            engineBound = false;
         }
         super.onDestroy();
     }

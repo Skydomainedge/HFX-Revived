@@ -31,6 +31,7 @@ public abstract class WriteFileCall implements Callable<Void> {
     private final ArrayList<LinkedList<FileBlock>> dequeArray;
     private final int maxOpenFiles;
     private boolean canceled = false;
+    private volatile String cancelErrorMessage = null;
 
     private final Map<Integer, FileWriteState> activeFiles = new HashMap<>();
     private final LinkedHashMap<Integer, FileWriteState> openPool = new LinkedHashMap<>(16, 0.75f, true);
@@ -104,6 +105,9 @@ public abstract class WriteFileCall implements Callable<Void> {
                 block = takeBlock();
             }
 
+            if (cancelErrorMessage != null) {
+                throw new IOException(cancelErrorMessage);
+            }
             if (!canceled) {
                 finalizeAllRemaining();
             }
@@ -264,6 +268,11 @@ public abstract class WriteFileCall implements Callable<Void> {
             }
         }
         notifyAll();
+    }
+
+    public synchronized void cancelWithError(String reason) {
+        this.cancelErrorMessage = (reason != null && !reason.isEmpty()) ? reason : "Transfer cancelled";
+        cancel();
     }
 
     public synchronized void putBlock(FileBlock block, int tIndex) {

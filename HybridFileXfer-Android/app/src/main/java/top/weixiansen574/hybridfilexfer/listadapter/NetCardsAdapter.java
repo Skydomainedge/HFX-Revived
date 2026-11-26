@@ -18,38 +18,30 @@ import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.RecyclerView;
 
-import java.io.IOException;
 import java.net.InetAddress;
-import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.List;
 
 import top.weixiansen574.hybridfilexfer.NetCardIcon;
 import top.weixiansen574.hybridfilexfer.R;
-import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
 import top.weixiansen574.hybridfilexfer.core.ipc.IpcPayloads;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
 import top.weixiansen574.hybridfilexfer.core.protocol.RailType;
 import top.weixiansen574.hybridfilexfer.engine.UsbNicAdvisor;
 
+/**
+ * Pure thin display adapter rendering {@link IpcDtos.NicInfo} supplied by {@code IHfxEngine}.
+ */
 public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHolder> {
 
     private final Context context;
-    private final UsbNicAdvisor advisor;
-    private UsbNicAdvisor.AdviceResult lastAdvice;
-    private List<ItemServerNetInterface> netInterfaceList;
+    private List<ItemServerNetInterface> netInterfaceList = new ArrayList<>();
     private boolean enableModify = true;
 
-    public NetCardsAdapter(Context context) throws IOException {
-        this(context, new UsbNicAdvisor());
-    }
-
-    public NetCardsAdapter(Context context, UsbNicAdvisor advisor) throws IOException {
+    public NetCardsAdapter(Context context) {
         this.context = context;
-        this.advisor = advisor != null ? advisor : new UsbNicAdvisor();
-        this.netInterfaceList = loadAdvisedInterfaces();
     }
 
     @NonNull
@@ -72,7 +64,6 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
         holder.editClientBindIP.setEnabled(enableModify && enableBindIpInput);
         holder.cbEnable.setEnabled(enableModify);
 
-        // Detach previous listeners before updating state to prevent recycled/rebound ViewHolder contamination
         holder.cbEnable.setOnCheckedChangeListener(null);
         if (holder.bindIpWatcher != null) {
             holder.editClientBindIP.removeTextChangedListener(holder.bindIpWatcher);
@@ -112,11 +103,10 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
     }
 
     private String formatSubtitle(ItemServerNetInterface item) {
-        String ip = item.address.getHostAddress();
         if (!TextUtils.isEmpty(item.note)) {
-            return ip + " · " + item.note;
+            return item.ip + " · " + item.note;
         }
-        return ip;
+        return item.ip;
     }
 
     @Override
@@ -124,95 +114,118 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
         return netInterfaceList.size();
     }
 
-    public UsbNicAdvisor.AdviceResult getLastAdvice() {
-        return lastAdvice;
-    }
+    @SuppressLint("NotifyDataSetChanged")
+    public void updateFromNics(List<IpcDtos.NicInfo> nics,
+                               String udcSpeed,
+                               IpcPayloads.RailConflictResolvedPayload conflictResolved,
+                               List<IpcDtos.RailStatusInfo> activeRails) {
+        String defaultState = context.getString(R.string.not_run);
+        String udcLabel = UsbNicAdvisor.formatUdcSpeedShortLabel(udcSpeed);
 
-    public String getUdcSpeed() {
-        return lastAdvice != null ? lastAdvice.udcSpeed : UsbNicAdvisor.SPEED_UNKNOWN;
-    }
-
-    public boolean isVpnActive() {
-        return lastAdvice != null && lastAdvice.vpnActive;
-    }
-
-    public IpcPayloads.RailConflictResolvedPayload getConflictResolved() {
-        return lastAdvice != null ? lastAdvice.conflictResolved : null;
-    }
-
-    public void changeItemState(String name, String state) {
-        for (int i = 0; i < netInterfaceList.size(); i++) {
-            ItemServerNetInterface item = netInterfaceList.get(i);
-            if (item.name.equals(name)) {
-                item.state = state;
-                notifyItemChanged(i);
+        List<ItemServerNetInterface> items = new ArrayList<>();
+        if (nics != null) {
+            for (IpcDtos.NicInfo nic : nics) {
+                RailType railType = parseRailType(nic.railType, nic.name);
+                ItemServerNetInterface item = new ItemServerNetInterface(nic.name, nic.ip, railType, defaultState);
+                item.enable = nic.selected;
+                if (nic.clientBindIp != null) {
+                    item.clientBindAddress = nic.clientBindIp;
+                }
+                if (nic.usbNic) {
+                    item.tag = !udcLabel.isEmpty() ? udcLabel : "USB NIC";
+                } else if (nic.vpn) {
+                    item.tag = "VPN";
+                } else if (railType == RailType.ADB && !udcLabel.isEmpty()) {
+                    item.tag = udcLabel;
+                }
+                if (UsbNicAdvisor.REASON_USB_NIC_ACTIVE_AUTO_DISABLED.equals(nic.reason)
+                        && conflictResolved != null
+                        && !conflictResolved.activeUsbNics.isEmpty()) {
+                    item.note = "auto-off (" + TextUtils.join(",", conflictResolved.activeUsbNics) + ")";
+                }
+                items.add(item);
             }
         }
+        this.netInterfaceList = items;
+        if (activeRails != null && !activeRails.isEmpty()) {
+            applyRailStatuses(activeRails);
+        } else {
+            notifyDataSetChanged();
+        }
+    }
+
+    @SuppressLint("NotifyDataSetChanged")
+    public void applyRailStatuses(List<IpcDtos.RailStatusInfo> rails) {
+        if (rails == null || rails.isEmpty()) {
+            String notRun = context.getString(R.string.not_run);
+            for (ItemServerNetInterface item : netInterfaceList) {
+                item.state = notRun;
+            }
+            notifyDataSetChanged();
+            return;
+        }
+        for (ItemServerNetInterface item : netInterfaceList) {
+            for (IpcDtos.RailStatusInfo r : rails) {
+                if (item.name.equals(r.name)) {
+                    item.state = mapRailStateLabel(r.state, r.streamCount);
+                    break;
+                }
+            }
+        }
+        notifyDataSetChanged();
+    }
+
+    private String mapRailStateLabel(String railState, int streamCount) {
+        if ("CONNECTED".equals(railState)) {
+            String base = context.getString(R.string.yi_lian_jie);
+            return streamCount > 1 ? (base + " ×" + streamCount) : base;
+        }
+        if ("WAITING".equals(railState) || "STARTING".equals(railState)) {
+            return context.getString(R.string.deng_dai_lian_jie);
+        }
+        if ("FAILED".equals(railState)) {
+            return context.getString(R.string.lian_jie_shi_bai);
+        }
+        return context.getString(R.string.not_run);
     }
 
     @SuppressLint("NotifyDataSetChanged")
     public void setEnableModify(boolean enableModify) {
         this.enableModify = enableModify;
         if (enableModify) {
+            String notRun = context.getString(R.string.not_run);
             for (ItemServerNetInterface item : netInterfaceList) {
-                item.state = context.getString(R.string.not_run);
+                item.state = notRun;
             }
         }
         notifyDataSetChanged();
     }
 
-    public List<ServerNetInterface> getSelectedInterfaces() {
-        List<ServerNetInterface> serverNetInterfaceList = new ArrayList<>();
-        for (ItemServerNetInterface netInterface : netInterfaceList) {
-            if (netInterface.enable) {
+    public List<IpcDtos.RailSelection> getSelectedRailSelections() {
+        List<IpcDtos.RailSelection> selections = new ArrayList<>();
+        for (ItemServerNetInterface item : netInterfaceList) {
+            if (!item.enable) {
+                continue;
+            }
+            String bindTrimmed = item.clientBindAddress != null ? item.clientBindAddress.trim() : "";
+            if (!bindTrimmed.isEmpty()) {
                 try {
-                    serverNetInterfaceList.add(netInterface.toServerNetInterface());
-                } catch (Exception e) {
-                    Toast.makeText(context, context.getString(R.string.invalid_ip) + netInterface.clientBindAddress,
+                    InetAddress.getByName(bindTrimmed);
+                } catch (UnknownHostException e) {
+                    Toast.makeText(context, context.getString(R.string.invalid_ip) + bindTrimmed,
                             Toast.LENGTH_SHORT).show();
                     return null;
                 }
             }
+            IpcDtos.RailSelection sel = new IpcDtos.RailSelection();
+            sel.name = item.name;
+            sel.ip = item.ip;
+            sel.bindIp = bindTrimmed.isEmpty() ? null : bindTrimmed;
+            sel.railType = item.railType.name();
+            sel.streamCount = 1;
+            selections.add(sel);
         }
-        return serverNetInterfaceList;
-    }
-
-    @SuppressLint("NotifyDataSetChanged")
-    public void reload() throws SocketException, UnknownHostException {
-        netInterfaceList = loadAdvisedInterfaces();
-        notifyDataSetChanged();
-    }
-
-    private ArrayList<ItemServerNetInterface> loadAdvisedInterfaces() throws SocketException, UnknownHostException {
-        UsbNicAdvisor.AdviceResult advice = advisor.advise();
-        this.lastAdvice = advice;
-        String defaultState = context.getString(R.string.not_run);
-        String udcLabel = UsbNicAdvisor.formatUdcSpeedShortLabel(advice.udcSpeed);
-
-        ArrayList<ItemServerNetInterface> items = new ArrayList<>(advice.nics.size());
-        for (IpcDtos.NicInfo nic : advice.nics) {
-            RailType railType = parseRailType(nic.railType, nic.name);
-            InetAddress addr = InetAddress.getByName(nic.ip);
-            ItemServerNetInterface item = new ItemServerNetInterface(nic.name, addr, railType, defaultState);
-            item.enable = nic.selected;
-            if (nic.clientBindIp != null) {
-                item.clientBindAddress = nic.clientBindIp;
-            }
-            if (nic.usbNic) {
-                item.tag = !udcLabel.isEmpty() ? udcLabel : "USB NIC";
-            } else if (nic.vpn) {
-                item.tag = "VPN";
-            } else if (railType == RailType.ADB && !udcLabel.isEmpty()) {
-                item.tag = udcLabel;
-            }
-            if (UsbNicAdvisor.REASON_USB_NIC_ACTIVE_AUTO_DISABLED.equals(nic.reason)
-                    && advice.conflictResolved != null
-                    && !advice.conflictResolved.activeUsbNics.isEmpty()) {
-                item.note = "auto-off (" + TextUtils.join(",", advice.conflictResolved.activeUsbNics) + ")";
-            }
-            items.add(item);
-        }
-        return items;
+        return selections;
     }
 
     private static RailType parseRailType(String railTypeName, String ifName) {
@@ -249,25 +262,18 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
     public static class ItemServerNetInterface {
         boolean enable = true;
         String name;
-        InetAddress address;
+        String ip;
         RailType railType;
         String clientBindAddress = "";
         String state;
         String tag = "";
         String note = "";
 
-        public ItemServerNetInterface(String name, InetAddress address, RailType railType, String state) {
+        public ItemServerNetInterface(String name, String ip, RailType railType, String state) {
             this.name = name;
-            this.address = address;
+            this.ip = ip != null ? ip : "127.0.0.1";
             this.railType = railType != null ? railType : RailType.inferFromInterfaceName(name);
             this.state = state;
-        }
-
-        public ServerNetInterface toServerNetInterface() throws UnknownHostException {
-            InetAddress bindAddr = TextUtils.isEmpty(clientBindAddress)
-                    ? null
-                    : InetAddress.getByName(clientBindAddress.trim());
-            return new ServerNetInterface(name, address, bindAddr, railType, 1);
         }
     }
 }

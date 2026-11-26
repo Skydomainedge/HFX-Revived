@@ -165,6 +165,18 @@ public abstract class ReadFileCall implements Callable<Void> {
         }
     }
 
+    public void cancelByUser() {
+        stopped = true;
+        recycleAllBuffer();
+        for (int i = 0; i < Math.max(1, operateThreadCount); i++) {
+            deque.addFirst(INTERRUPT);
+        }
+    }
+
+    public boolean isStopped() {
+        return stopped;
+    }
+
     private void recycleAllBuffer() {
         FileBlock fb;
         while ((fb = deque.poll()) != null) {
