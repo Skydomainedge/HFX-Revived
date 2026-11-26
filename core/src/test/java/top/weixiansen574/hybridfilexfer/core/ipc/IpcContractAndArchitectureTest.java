@@ -14,8 +14,11 @@ import java.util.Arrays;
 import java.util.List;
 
 import top.weixiansen574.hybridfilexfer.core.HFXService;
+import top.weixiansen574.hybridfilexfer.core.protocol.HmacAuth;
+import top.weixiansen574.hybridfilexfer.core.protocol.PairCallbackMessage;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
 
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -98,6 +101,39 @@ public class IpcContractAndArchitectureTest {
         JsonRpcResponse decodedErr = IpcJson.fromJson(IpcJson.toJson(errResp), JsonRpcResponse.class);
         assertFalse(decodedErr.isSuccess());
         assertEquals(JsonRpcError.UNAUTHORIZED, decodedErr.error.code);
+    }
+
+    @Test
+    public void testPairingSecretDerivationAndProofVerification() {
+        byte[] token = HmacAuth.generateRandomBytes(16);
+        String pcId = "aabbccddeeff";
+        String phoneId = "112233445566";
+        String nonce = "nonce-1234";
+
+        byte[] s1 = HmacAuth.derivePairSecret(token, pcId, phoneId);
+        byte[] s2 = HmacAuth.derivePairSecret(token, pcId, phoneId);
+        assertEquals(32, s1.length);
+        assertArrayEquals(s1, s2);
+
+        String proof = HmacAuth.computePairProof(token, pcId, phoneId, 5740, nonce);
+        assertTrue(HmacAuth.verifyPairProof(token, pcId, phoneId, 5740, nonce, proof));
+        assertFalse(HmacAuth.verifyPairProof(token, pcId, phoneId, 5741, nonce, proof));
+        assertFalse(HmacAuth.verifyPairProof(token, pcId, "other-phone", 5740, nonce, proof));
+
+        String ack = HmacAuth.computePairAckProof(token, pcId, phoneId, nonce);
+        assertTrue(HmacAuth.verifyPairAckProof(token, pcId, phoneId, nonce, ack));
+        assertFalse(HmacAuth.verifyPairAckProof(token, pcId, phoneId, "wrong-nonce", ack));
+
+        PairCallbackMessage.Request req = new PairCallbackMessage.Request();
+        req.deviceId = phoneId;
+        req.deviceName = "OnePlus 13";
+        req.port = 5740;
+        req.nonce = nonce;
+        req.proof = proof;
+        PairCallbackMessage.Request decoded = IpcJson.fromJson(
+                IpcJson.toJson(req), PairCallbackMessage.Request.class);
+        assertEquals(phoneId, decoded.deviceId);
+        assertEquals(proof, decoded.proof);
     }
 
     @Test

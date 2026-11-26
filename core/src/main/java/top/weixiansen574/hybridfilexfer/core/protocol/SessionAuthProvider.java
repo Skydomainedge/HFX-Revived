@@ -22,4 +22,10 @@ public interface SessionAuthProvider {
      * Looks up the shared pairing secret for {@code clientId}, or returns {@code null} if unknown.
      */
     byte[] lookupPairSecret(String clientId);
+
+    /**
+     * Notified when a client successfully passes HMAC-SHA256 verification.
+     */
+    default void onAuthSucceeded(String clientId) {
+    }
 }

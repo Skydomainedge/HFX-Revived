@@ -253,15 +253,19 @@ public class HfxEngineControllerTest {
                 }
             });
 
-            // 1) Initial snapshot & M4 method placeholder check
+            // 1) Initial snapshot & M4 method validation
             IpcDtos.EngineSnapshot initSnap = controller.getSnapshot();
             assertEquals("android", initSnap.engineRole);
             assertEquals(ProtocolConstants.VERSION_CODE, initSnap.protocolVersion);
             assertEquals(SessionState.IDLE, initSnap.state);
 
-            JsonRpcResponse m4Resp = controller.dispatch(null, IpcMethods.PAIR_SUBMIT_QR_URI, new JsonObject());
-            assertFalse(m4Resp.isSuccess());
-            assertEquals(JsonRpcError.METHOD_NOT_FOUND, m4Resp.error.code);
+            JsonRpcResponse pcOnlyResp = controller.dispatch(null, IpcMethods.PAIR_START_QR, new JsonObject());
+            assertFalse(pcOnlyResp.isSuccess());
+            assertEquals(JsonRpcError.METHOD_NOT_FOUND, pcOnlyResp.error.code);
+
+            JsonRpcResponse badUriResp = controller.dispatch(null, IpcMethods.PAIR_SUBMIT_QR_URI, new JsonObject());
+            assertFalse(badUriResp.isSuccess());
+            assertEquals(JsonRpcError.INVALID_PARAMS, badUriResp.error.code);
 
             // 2) Advice conflict event broadcast
             UsbNicAdvisor.AdviceResult syntheticAdvice = new UsbNicAdvisor().advise(
@@ -414,8 +418,8 @@ public class HfxEngineControllerTest {
             }
         }
 
-        assertTrue("Expected UsbNicAdvisor, HfxEngineController, and HfxEngineService classes",
-                engineClasses.size() >= 3);
+        assertTrue("Expected UsbNicAdvisor, HfxEngineController, HfxEngineService, TrustedPcStore, NsdAdvertiser, and PairClient classes",
+                engineClasses.size() >= 6);
 
         for (Map.Entry<String, byte[]> entry : engineClasses.entrySet()) {
             String className = entry.getKey();
@@ -426,6 +430,8 @@ public class HfxEngineControllerTest {
                     content.contains("Ltop/weixiansen574/hybridfilexfer/MainActivity;"));
             assertFalse("engine/ must NOT reference TransferActivity: " + className,
                     content.contains("Ltop/weixiansen574/hybridfilexfer/TransferActivity;"));
+            assertFalse("engine/ must NOT reference QrScanActivity: " + className,
+                    content.contains("Ltop/weixiansen574/hybridfilexfer/QrScanActivity;"));
             assertFalse("engine/ must NOT reference android.view.*: " + className,
                     content.contains("Landroid/view/"));
             assertFalse("engine/ must NOT reference android.widget.* (incl. Toast): " + className,
@@ -434,8 +440,10 @@ public class HfxEngineControllerTest {
                     content.contains("Landroidx/recyclerview/"));
             assertFalse("engine/ must NOT reference PrintStream: " + className,
                     content.contains("Ljava/io/PrintStream;"));
-            if (className.contains("UsbNicAdvisor") || className.contains("HfxEngineController")) {
-                assertFalse("Pure-Java engine controller/advisor must NOT reference android.*: " + className,
+            if (className.contains("UsbNicAdvisor") || className.contains("HfxEngineController")
+                    || className.contains("TrustedPcStore") || className.contains("PairClient")
+                    || className.contains("MdnsAdvertisementBridge")) {
+                assertFalse("Pure-Java engine classes must NOT reference android.*: " + className,
                         content.contains("Landroid/"));
             }
         }

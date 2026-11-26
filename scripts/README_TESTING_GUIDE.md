@@ -12,6 +12,7 @@
 
 | 脚本文件 | 用途 | 双击运行效果 |
 |---|---|---|
+| `start-auto-pair.bat` | **M4 零配置自动发现 / Win11 通知扫码绑定（推荐）** | 优先拉起 `HybridFileXferLauncher.exe`（Win11 原生 Toast 宿主，未编译时自动降级 `hfx-shell --auto/--pair`）：<br>• 直接回车：**mDNS 自动发现模式**（`<2s` 发现已信任手机即经 HMAC 秒连；未发现时自动生成 480×480 PNG 推送 Win11 通知，内联无裁切展示）；<br>• 输入 `pair`：**立即首次扫码绑定**（手机点击主页顶部扫码按钮对准通知二维码，识别后约 1 秒动效反馈并返回自动建连，防火墙拦截 `:5741` 自动走 mDNS `pair_ack` 反向兜底）。 |
 | `start-adb-turbo.bat` | **ADB 极速有线轨启动** | 自动定位最新 `hfx-shell-*.jar` 与最高版 `adb.exe`，自动枚举已连设备（单设备直接选定），支持三种模式：<br>• 直接回车：**ADB Turbo 自动模式**（进程级注入 `ADB_LIBUSB=1` + `ADB_BURST_MODE=1`，缺失 `delayed_ack` 时自动启用 4 并发流）；<br>• 输入 `1`~`8`：强制指定并发流数（如 `4` / `2`）；<br>• 输入 `legacy`：旧版同步模式（`--adb-legacy`），用于与 Turbo 做 A/B 对比测速。 |
 | `start-usb-nic-or-ip.bat` | **USB 网卡 (NCM/RNDIS) / Wi-Fi 直连 IP 启动** | 交互式输入手机端展示的 USB 网卡 IP（`ncm0`/`rndis0`，如 `10.x.x.x`）或 Wi-Fi IP（`192.168.x.x`），**自动记忆上次 IP**（保存在 `%LOCALAPPDATA%\HybridFileXfer\last_direct_host.txt`，下次直接回车复用），默认自动同网段源 IP `bind` 防多网关/代理 TUN 路由误判。 |
 | `start-engine-ipc.bat` | **PC 无头引擎 IPC 守护进程启动** | 启动 `hfx-engine-*.jar --ipc=tcp://127.0.0.1:0`，生成一次性随机 `ipcToken` 并原子写入 `%LOCALAPPDATA%\HybridFileXfer\engine.ipc.json`，自动在窗口打印监听端点、PID 与 Token；按 `Ctrl+C` 优雅退出并自动删除 `engine.ipc.json`。 |

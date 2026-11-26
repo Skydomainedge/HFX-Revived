@@ -11,6 +11,9 @@ public interface ServerHandshakeCallback {
     default void onAuthFailed(String clientId, String reason) {
     }
 
+    default void onAuthSucceeded(String clientId) {
+    }
+
     void onRailAccepted(String name, int railId, int streamIndex, int streamCount);
 
     void onAcceptFailed(String name);

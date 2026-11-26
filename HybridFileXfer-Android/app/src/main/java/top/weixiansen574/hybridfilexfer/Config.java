@@ -63,4 +63,15 @@ public class Config {
     public String getConnectServerControllerIp(){
         return preferences.getString("connect_server_controller_ip","");
     }
+
+    public synchronized String getOrCreateDeviceId() {
+        String existing = preferences.getString("mobile_device_id", null);
+        if (existing != null && !existing.trim().isEmpty()) {
+            return existing.trim();
+        }
+        String generated = top.weixiansen574.hybridfilexfer.core.protocol.HmacAuth.toHex(
+                top.weixiansen574.hybridfilexfer.core.protocol.HmacAuth.generateRandomBytes(6));
+        preferences.edit().putString("mobile_device_id", generated).apply();
+        return generated;
+    }
 }

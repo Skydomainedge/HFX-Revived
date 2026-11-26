@@ -172,6 +172,8 @@ public abstract class AbstractHFXServer extends HFXService {
                         closeQuietly(ctrl);
                         continue;
                     }
+                    authProvider.onAuthSucceeded(clientId);
+                    callback.onAuthSucceeded(clientId);
                 }
 
                 byte[] sessionToken = HmacAuth.generateRandomBytes(ProtocolConstants.SESSION_TOKEN_LENGTH);

@@ -76,6 +76,80 @@ public final class HmacAuth {
         return sha256Hex(token).substring(0, 16);
     }
 
+    /**
+     * Deterministically derives the 32-byte shared {@code pairSecret} from the one-time QR token,
+     * PC ID, and mobile device ID. Both direct HTTP pairing and mDNS {@code pair_ack} fallback
+     * derive the identical secret without ever sending {@code token} or {@code pairSecret} in
+     * plaintext over the network.
+     */
+    public static byte[] derivePairSecret(byte[] token, String pcId, String deviceId) {
+        return hmacSha256(token, "hfx-secret-v1|" + safe(pcId) + "|" + safe(deviceId));
+    }
+
+    /**
+     * Computes the mobile-to-PC pairing proof for {@code POST /hfx/pair}.
+     */
+    public static String computePairProof(byte[] token, String pcId, String deviceId,
+                                          int serverPort, String nonce) {
+        byte[] mac = hmacSha256(token,
+                "hfx-pair-v1|" + safe(pcId) + "|" + safe(deviceId) + "|" + serverPort + "|" + safe(nonce));
+        return Base64Url.encode(mac);
+    }
+
+    /**
+     * Constant-time verification of the mobile-to-PC pairing proof.
+     */
+    public static boolean verifyPairProof(byte[] token, String pcId, String deviceId,
+                                          int serverPort, String nonce, String candidateProof) {
+        if (token == null || token.length == 0 || candidateProof == null || candidateProof.isEmpty()) {
+            return false;
+        }
+        String expected = computePairProof(token, pcId, deviceId, serverPort, nonce);
+        return MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8),
+                candidateProof.getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Computes the PC-to-mobile acknowledgement proof returned by {@code POST /hfx/pair}.
+     */
+    public static String computePairAckProof(byte[] token, String pcId, String deviceId, String nonce) {
+        byte[] mac = hmacSha256(token,
+                "hfx-pair-ack-v1|" + safe(pcId) + "|" + safe(deviceId) + "|" + safe(nonce));
+        return Base64Url.encode(mac);
+    }
+
+    /**
+     * Constant-time verification of the PC-to-mobile acknowledgement proof.
+     */
+    public static boolean verifyPairAckProof(byte[] token, String pcId, String deviceId,
+                                             String nonce, String candidateAckProof) {
+        if (token == null || token.length == 0 || candidateAckProof == null || candidateAckProof.isEmpty()) {
+            return false;
+        }
+        String expected = computePairAckProof(token, pcId, deviceId, nonce);
+        return MessageDigest.isEqual(
+                expected.getBytes(StandardCharsets.UTF_8),
+                candidateAckProof.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private static byte[] hmacSha256(byte[] key, String message) {
+        if (key == null || key.length == 0) {
+            throw new IllegalArgumentException("HMAC key must not be empty");
+        }
+        try {
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec(key, "HmacSHA256"));
+            return mac.doFinal(message.getBytes(StandardCharsets.UTF_8));
+        } catch (GeneralSecurityException e) {
+            throw new IllegalStateException("HmacSHA256 unavailable", e);
+        }
+    }
+
+    private static String safe(String s) {
+        return s == null ? "" : s;
+    }
+
     public static String toHex(byte[] bytes) {
         char[] chars = new char[bytes.length * 2];
         for (int i = 0; i < bytes.length; i++) {

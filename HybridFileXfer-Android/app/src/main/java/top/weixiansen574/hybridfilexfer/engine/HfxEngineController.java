@@ -14,9 +14,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -39,6 +41,7 @@ import top.weixiansen574.hybridfilexfer.core.ipc.JsonRpcError;
 import top.weixiansen574.hybridfilexfer.core.ipc.JsonRpcRequest;
 import top.weixiansen574.hybridfilexfer.core.ipc.JsonRpcResponse;
 import top.weixiansen574.hybridfilexfer.core.ipc.SessionState;
+import top.weixiansen574.hybridfilexfer.core.protocol.PairUriCodec;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
 import top.weixiansen574.hybridfilexfer.core.protocol.RailType;
 
@@ -82,6 +85,9 @@ public class HfxEngineController implements AutoCloseable {
     private final String deviceName;
     private final UsbNicAdvisor usbNicAdvisor;
     private final ServerSessionBackend backend;
+    private final TrustedPcStore trustedPcStore;
+    private final MdnsAdvertisementBridge mdnsBridge;
+    private final PairClient pairClient;
     private final long progressThrottleMs;
 
     private final CopyOnWriteArrayList<EventListener> listeners = new CopyOnWriteArrayList<>();
@@ -89,11 +95,19 @@ public class HfxEngineController implements AutoCloseable {
 
     private final ExecutorService serverExecutor = Executors.newSingleThreadExecutor(new NamedThreadFactory("hfx-android-server"));
     private final ExecutorService transferExecutor = Executors.newSingleThreadExecutor(new NamedThreadFactory("hfx-android-transfer"));
+    private final ExecutorService pairExecutor = Executors.newSingleThreadExecutor(new NamedThreadFactory("hfx-android-pair"));
 
     private volatile SessionState state = SessionState.IDLE;
     private volatile UsbNicAdvisor.AdviceResult lastAdvice;
     private volatile List<IpcDtos.RailStatusInfo> railStatuses = Collections.emptyList();
     private volatile AbstractHFXServer activeServer;
+    private volatile CountDownLatch activeServerBoundLatch;
+    private volatile int activeServerPort = ProtocolConstants.DEFAULT_CONTROL_PORT;
+    private volatile String activePairAck;
+    private volatile int defaultPairServerPort = ProtocolConstants.DEFAULT_CONTROL_PORT;
+    private volatile int defaultPairIoMode = 0;
+    private volatile int defaultPairLocalBuffers = 256;
+    private volatile int defaultPairRemoteBuffers = 512;
     private volatile String remoteHomeDir = "/";
     private volatile int remoteFileSystem = Directory.FILE_SYSTEM_UNIX;
     private volatile IpcPayloads.TransferProgressPayload lastTransferProgress;
@@ -105,7 +119,8 @@ public class HfxEngineController implements AutoCloseable {
                                String deviceName,
                                UsbNicAdvisor usbNicAdvisor,
                                ServerSessionBackend backend) {
-        this(deviceId, deviceName, usbNicAdvisor, backend, DEFAULT_PROGRESS_THROTTLE_MS);
+        this(deviceId, deviceName, usbNicAdvisor, backend, DEFAULT_PROGRESS_THROTTLE_MS,
+                new TrustedPcStore(), MdnsAdvertisementBridge.NO_OP, new PairClient());
     }
 
     public HfxEngineController(String deviceId,
@@ -113,6 +128,18 @@ public class HfxEngineController implements AutoCloseable {
                                UsbNicAdvisor usbNicAdvisor,
                                ServerSessionBackend backend,
                                long progressThrottleMs) {
+        this(deviceId, deviceName, usbNicAdvisor, backend, progressThrottleMs,
+                new TrustedPcStore(), MdnsAdvertisementBridge.NO_OP, new PairClient());
+    }
+
+    public HfxEngineController(String deviceId,
+                               String deviceName,
+                               UsbNicAdvisor usbNicAdvisor,
+                               ServerSessionBackend backend,
+                               long progressThrottleMs,
+                               TrustedPcStore trustedPcStore,
+                               MdnsAdvertisementBridge mdnsBridge,
+                               PairClient pairClient) {
         this.deviceId = (deviceId != null && !deviceId.trim().isEmpty())
                 ? deviceId.trim() : UUID.randomUUID().toString();
         this.deviceName = (deviceName != null && !deviceName.trim().isEmpty())
@@ -120,6 +147,38 @@ public class HfxEngineController implements AutoCloseable {
         this.usbNicAdvisor = usbNicAdvisor != null ? usbNicAdvisor : new UsbNicAdvisor();
         this.backend = backend;
         this.progressThrottleMs = Math.max(100L, progressThrottleMs);
+        this.trustedPcStore = trustedPcStore != null ? trustedPcStore : new TrustedPcStore();
+        this.mdnsBridge = mdnsBridge != null ? mdnsBridge : MdnsAdvertisementBridge.NO_OP;
+        this.pairClient = pairClient != null ? pairClient : new PairClient();
+
+        this.trustedPcStore.setPendingCommitListener(new TrustedPcStore.PendingCommitListener() {
+            @Override
+            public void onPendingPairingCommitted(TrustedPcStore.TrustedPcRecord record, boolean viaFallbackMdns) {
+                activePairAck = null;
+                HfxEngineController.this.mdnsBridge.updatePairAck(null);
+                IpcPayloads.PairSucceededPayload ok = new IpcPayloads.PairSucceededPayload();
+                ok.peerId = record.pcId;
+                ok.peerName = record.pcName;
+                ok.controlIps = record.lastIps != null ? new ArrayList<>(record.lastIps) : new ArrayList<>();
+                ok.viaFallbackMdns = viaFallbackMdns;
+                emitEvent(IpcEvents.PAIR_SUCCEEDED, ok);
+            }
+        });
+    }
+
+    public void configurePairDefaults(int serverPort, int ioMode, int localBuffers, int remoteBuffers) {
+        if (serverPort > 0) this.defaultPairServerPort = serverPort;
+        this.defaultPairIoMode = Math.max(0, ioMode);
+        if (localBuffers >= 16) this.defaultPairLocalBuffers = localBuffers;
+        if (remoteBuffers >= 16) this.defaultPairRemoteBuffers = remoteBuffers;
+    }
+
+    public TrustedPcStore getTrustedPcStore() {
+        return trustedPcStore;
+    }
+
+    public String getDeviceId() {
+        return deviceId;
     }
 
     public void addEventListener(EventListener listener) {
@@ -220,14 +279,23 @@ public class HfxEngineController implements AutoCloseable {
                 return ok(id, cancelTransfer());
             } else if (IpcMethods.ENGINE_SHUTDOWN.equals(m)) {
                 return ok(id, shutdown());
+            } else if (IpcMethods.PAIR_SUBMIT_QR_URI.equals(m)) {
+                IpcPayloads.PairSubmitUriParams p = params != null
+                        ? IpcJson.fromJson(params, IpcPayloads.PairSubmitUriParams.class)
+                        : null;
+                return ok(id, submitQrUri(p));
+            } else if (IpcMethods.PAIR_CANCEL.equals(m)) {
+                return ok(id, cancelPairing());
             } else if (IpcMethods.PEERS_LIST.equals(m)) {
-                return ok(id, new IpcPayloads.PeersListResult());
-            } else if (IpcMethods.PAIR_START_QR.equals(m)
-                    || IpcMethods.PAIR_CANCEL.equals(m)
-                    || IpcMethods.PAIR_SUBMIT_QR_URI.equals(m)
-                    || IpcMethods.PEERS_REMOVE.equals(m)) {
+                return ok(id, listTrustedPeers());
+            } else if (IpcMethods.PEERS_REMOVE.equals(m)) {
+                IpcPayloads.PeerRemoveParams p = params != null
+                        ? IpcJson.fromJson(params, IpcPayloads.PeerRemoveParams.class)
+                        : null;
+                return ok(id, removeTrustedPeer(p));
+            } else if (IpcMethods.PAIR_START_QR.equals(m)) {
                 return JsonRpcResponse.error(id, JsonRpcError.METHOD_NOT_FOUND,
-                        "Method scheduled for M4 (mDNS/QR pairing): " + m);
+                        "Method is only supported on PC engine: " + m);
             } else {
                 return JsonRpcResponse.error(id, JsonRpcError.METHOD_NOT_FOUND, "Unknown method: " + m);
             }
@@ -265,9 +333,166 @@ public class HfxEngineController implements AutoCloseable {
             snap.udcSpeed = UsbNicAdvisor.SPEED_UNKNOWN;
         }
         snap.rails = new ArrayList<>(this.railStatuses);
+        snap.trustedPeers = trustedPcStore.listPeers();
         snap.remoteHomeDir = this.remoteHomeDir;
         snap.remoteFileSystem = this.remoteFileSystem;
         return snap;
+    }
+
+    // ---- M4 Pairing & Trusted PC Management ----
+
+    public IpcPayloads.OkResult submitQrUri(IpcPayloads.PairSubmitUriParams params) throws ControllerException {
+        if (closed.get()) {
+            throw new ControllerException(JsonRpcError.INVALID_STATE, "Engine is shut down");
+        }
+        if (params == null || params.uri == null || params.uri.trim().isEmpty()) {
+            throw new ControllerException(JsonRpcError.INVALID_PARAMS, "uri is required");
+        }
+        final PairUriCodec.PairPayload payload;
+        try {
+            payload = PairClient.parseQrUri(params.uri.trim());
+        } catch (IllegalArgumentException e) {
+            throw new ControllerException(JsonRpcError.INVALID_PARAMS, "Invalid QR URI: " + e.getMessage());
+        }
+
+        pairExecutor.submit(new Runnable() {
+            @Override
+            public void run() {
+                runPairingWorkflow(payload);
+            }
+        });
+        String label = (payload.hostName != null && !payload.hostName.isEmpty()) ? payload.hostName : payload.pcId;
+        return new IpcPayloads.OkResult(true, label);
+    }
+
+    public IpcPayloads.OkResult cancelPairing() {
+        pairClient.cancel();
+        trustedPcStore.clearPendingPairing();
+        activePairAck = null;
+        mdnsBridge.updatePairAck(null);
+        return new IpcPayloads.OkResult(true, "Pairing cancelled");
+    }
+
+    public IpcPayloads.PeersListResult listTrustedPeers() {
+        IpcPayloads.PeersListResult res = new IpcPayloads.PeersListResult();
+        res.peers = trustedPcStore.listPeers();
+        return res;
+    }
+
+    public IpcPayloads.OkResult removeTrustedPeer(IpcPayloads.PeerRemoveParams params) throws ControllerException {
+        if (params == null || params.deviceId == null || params.deviceId.trim().isEmpty()) {
+            throw new ControllerException(JsonRpcError.INVALID_PARAMS, "deviceId is required");
+        }
+        boolean removed = trustedPcStore.removePeer(params.deviceId.trim());
+        return new IpcPayloads.OkResult(removed, removed ? "Peer removed" : "Peer not found");
+    }
+
+    private void runPairingWorkflow(final PairUriCodec.PairPayload payload) {
+        final List<String> advertisedIps = new ArrayList<>();
+        final String[] detectedUsbType = new String[1];
+
+        pairClient.executePairing(
+                payload,
+                this.deviceId,
+                this.deviceName,
+                this.defaultPairServerPort,
+                advertisedIps,
+                null,
+                new PairClient.PairCallback() {
+                    @Override
+                    public PairClient.PreparedServerInfo onPrepareServerAndPendingTrust(
+                            PairUriCodec.PairPayload p, byte[] pairSecret) throws Exception {
+                        trustedPcStore.registerPendingPairing(
+                                p.pcId, p.hostName, pairSecret, p.ips, 120_000L, false);
+                        ensureServerListeningForPairing();
+                        collectAdvertisableMobileIps(advertisedIps, detectedUsbType);
+                        return new PairClient.PreparedServerInfo(activeServerPort, advertisedIps, detectedUsbType[0]);
+                    }
+
+                    @Override
+                    public void onDirectPairSucceeded(PairClient.PairOutcome outcome) {
+                        trustedPcStore.upsertTrustedPc(
+                                outcome.pcId, outcome.pcName, outcome.pairSecret, payload.ips);
+                        activePairAck = null;
+                        mdnsBridge.updatePairAck(null);
+                        IpcPayloads.PairSucceededPayload ok = new IpcPayloads.PairSucceededPayload();
+                        ok.peerId = outcome.pcId;
+                        ok.peerName = outcome.pcName;
+                        ok.controlIps = new ArrayList<>(payload.ips);
+                        ok.viaFallbackMdns = false;
+                        emitEvent(IpcEvents.PAIR_SUCCEEDED, ok);
+                    }
+
+                    @Override
+                    public void onActivateMdnsFallback(PairClient.PairOutcome outcome) {
+                        trustedPcStore.markPendingAsFallbackMdns(outcome.pcId);
+                        activePairAck = outcome.pairAckHash;
+                        List<String> mobileIps = new ArrayList<>();
+                        String[] usbHolder = new String[1];
+                        collectAdvertisableMobileIps(mobileIps, usbHolder);
+                        mdnsBridge.startAdvertising(
+                                activeServerPort,
+                                deviceId,
+                                deviceName,
+                                mobileIps,
+                                usbHolder[0],
+                                outcome.pairAckHash);
+                    }
+
+                    @Override
+                    public void onPairFailed(String code, String reason) {
+                        trustedPcStore.clearPendingPairing();
+                        activePairAck = null;
+                        mdnsBridge.updatePairAck(null);
+                        emitEvent(IpcEvents.PAIR_FAILED, new IpcPayloads.PairErrorPayload(code, reason));
+                    }
+                });
+    }
+
+    private void ensureServerListeningForPairing() throws Exception {
+        if (state == SessionState.CONNECTED || state == SessionState.TRANSFERRING) {
+            stopServer();
+        }
+        if (state == SessionState.IDLE || state == SessionState.ERROR) {
+            IpcPayloads.ServerStartParams startParams = new IpcPayloads.ServerStartParams();
+            startParams.port = defaultPairServerPort;
+            startParams.ioMode = defaultPairIoMode;
+            startParams.localBufferCount = defaultPairLocalBuffers;
+            startParams.remoteBufferCount = defaultPairRemoteBuffers;
+            startParams.authRequired = true;
+            startServer(startParams);
+        }
+        CountDownLatch boundLatch = this.activeServerBoundLatch;
+        if (boundLatch != null && !boundLatch.await(5, TimeUnit.SECONDS)) {
+            throw new IOException("Timed out waiting for HFXServer to bind port " + defaultPairServerPort);
+        }
+        if (state == SessionState.ERROR) {
+            throw new IOException("HFXServer failed to bind port " + defaultPairServerPort);
+        }
+    }
+
+    private void collectAdvertisableMobileIps(List<String> outIps, String[] outUsbType) {
+        outIps.clear();
+        List<IpcDtos.RailStatusInfo> rails = this.railStatuses;
+        if (rails != null) {
+            for (IpcDtos.RailStatusInfo r : rails) {
+                if (r.address != null && !r.address.isEmpty() && !"127.0.0.1".equals(r.address)) {
+                    if (!outIps.contains(r.address)) {
+                        outIps.add(r.address);
+                    }
+                    if (RailType.USB_NIC.name().equals(r.type) && outUsbType != null && outUsbType[0] == null) {
+                        outUsbType[0] = r.name;
+                    }
+                }
+            }
+        }
+        if (outIps.isEmpty() && rails != null) {
+            for (IpcDtos.RailStatusInfo r : rails) {
+                if (r.address != null && !r.address.isEmpty() && !outIps.contains(r.address)) {
+                    outIps.add(r.address);
+                }
+            }
+        }
     }
 
     public IpcPayloads.NicsRefreshResult refreshNics() throws ControllerException {
@@ -326,6 +551,8 @@ public class HfxEngineController implements AutoCloseable {
             this.activeTransferDirection = null;
             this.remoteHomeDir = "/";
             this.remoteFileSystem = Directory.FILE_SYSTEM_UNIX;
+            this.activeServerBoundLatch = new CountDownLatch(1);
+            this.activeServerPort = port;
             this.railStatuses = buildInitialRailStatuses(selectedInterfaces, "STARTING");
             transitionState(SessionState.DISCOVERING, "Starting server on port " + port);
             emitRailStatus(this.railStatuses);
@@ -362,6 +589,8 @@ public class HfxEngineController implements AutoCloseable {
                 server.setPreferredBlockSize(p.preferredBlockSize);
             }
             server.setSpeedMonitorIntervalMs(progressThrottleMs);
+            trustedPcStore.setExplicitAuthRequired(p.authRequired);
+            server.setAuthProvider(trustedPcStore);
 
             final AbstractHFXServer boundServer = server;
             final AtomicBoolean handshakeOk = new AtomicBoolean(false);
@@ -375,6 +604,8 @@ public class HfxEngineController implements AutoCloseable {
                     new ServerHandshakeCallback() {
                         @Override
                         public void onBindFailed(int failedPort) {
+                            CountDownLatch latch = activeServerBoundLatch;
+                            if (latch != null) latch.countDown();
                             emitEvent(IpcEvents.DIAGNOSTIC_WARNING,
                                     new IpcPayloads.DiagnosticWarningPayload("BIND_FAILED",
                                             "Failed to bind server port " + failedPort));
@@ -384,7 +615,23 @@ public class HfxEngineController implements AutoCloseable {
                         @Override
                         public void onServerStarted() {
                             if (sessionSeq.get() != mySessionId) return;
+                            int actualPort = boundServer.getBoundPort();
+                            if (actualPort > 0) {
+                                activeServerPort = actualPort;
+                            }
                             updateAllRailStates("WAITING", udcSpeed);
+                            List<String> mobileIps = new ArrayList<>();
+                            String[] usbHolder = new String[1];
+                            collectAdvertisableMobileIps(mobileIps, usbHolder);
+                            mdnsBridge.startAdvertising(
+                                    activeServerPort,
+                                    deviceId,
+                                    deviceName,
+                                    mobileIps,
+                                    usbHolder[0],
+                                    activePairAck);
+                            CountDownLatch latch = activeServerBoundLatch;
+                            if (latch != null) latch.countDown();
                         }
 
                         @Override
@@ -481,6 +728,8 @@ public class HfxEngineController implements AutoCloseable {
                 }
             }
         }
+        activePairAck = null;
+        mdnsBridge.stopAdvertising();
         emitRailStatus(Collections.emptyList());
         transitionState(SessionState.IDLE, "Server stopped");
         return new IpcPayloads.OkResult(true, "Stopped");
@@ -622,9 +871,12 @@ public class HfxEngineController implements AutoCloseable {
 
     public IpcPayloads.OkResult shutdown() {
         if (closed.compareAndSet(false, true)) {
+            cancelPairing();
             stopServer();
+            mdnsBridge.stopAdvertising();
             serverExecutor.shutdownNow();
             transferExecutor.shutdownNow();
+            pairExecutor.shutdownNow();
         }
         return new IpcPayloads.OkResult(true, "Engine shut down");
     }
@@ -946,6 +1198,7 @@ public class HfxEngineController implements AutoCloseable {
                     }
                 }
             }
+            mdnsBridge.stopAdvertising();
             emitRailStatus(Collections.emptyList());
             transitionState(SessionState.IDLE, "Session ended");
         }

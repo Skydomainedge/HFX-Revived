@@ -13,6 +13,9 @@ public final class CliOptions {
     public boolean adbLegacy;
     public Integer adbStreams;
     public boolean disableAutoBind;
+    public boolean pairMode;
+    public boolean autoMode;
+    public boolean noToast;
     public boolean showHelp;
     public boolean showVersion;
     public boolean emptyArgs;
@@ -66,6 +69,15 @@ public final class CliOptions {
                     break;
                 case "--no-auto-bind":
                     opts.disableAutoBind = !hasInlineValue || Boolean.parseBoolean(value);
+                    break;
+                case "--pair":
+                    opts.pairMode = !hasInlineValue || Boolean.parseBoolean(value);
+                    break;
+                case "--auto":
+                    opts.autoMode = !hasInlineValue || Boolean.parseBoolean(value);
+                    break;
+                case "--no-toast":
+                    opts.noToast = !hasInlineValue || Boolean.parseBoolean(value);
                     break;
                 case "-c":
                 case "--connect":

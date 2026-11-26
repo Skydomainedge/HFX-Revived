@@ -146,4 +146,12 @@
     <string name="engine_notif_connecting">Establishing multi-rail channels…</string>
     <string name="engine_notif_connected">Connected · ready for transfer</string>
     <string name="engine_notif_transferring">Transferring files…</string>
+    <string name="scan_qr_pair">Scan QR to Pair PC</string>
+    <string name="qr_scan_hint">Align the PC notification QR code inside the frame</string>
+    <string name="qr_scan_recognized_title">Recognized: %1$s</string>
+    <string name="qr_scan_recognized_subtitle">Pairing &amp; connecting…</string>
+    <string name="qr_scan_pair_succeeded">Paired &amp; connected: %1$s</string>
+    <string name="qr_scan_pair_failed">Pairing failed: %1$s</string>
+    <string name="qr_scan_invalid_code">Not a HybridFileXfer pairing QR code</string>
+    <string name="qr_scan_camera_permission_needed">Camera permission is required to scan QR codes</string>
 </resources>

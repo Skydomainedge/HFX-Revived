@@ -33,7 +33,7 @@ jobs:
       - name: 'Build and Test Monorepo'
         run: |
           chmod +x ./gradlew
-          ./gradlew :core:test :pc-engine:test :pc-engine:shadowJar :pc-shell:test :android:assembleDebug
+          ./gradlew :core:test :pc-engine:test :pc-engine:shadowJar :pc-shell:test :pc-shell:shadowJar :android:testDebugUnitTest :android:assembleDebug --no-daemon
 
       - name: 'Upload PC Engine JAR'
         if: '${{ success() }}'

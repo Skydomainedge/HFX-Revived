@@ -145,4 +145,12 @@
     <string name="engine_notif_connecting">正在建立多轨高速通道…</string>
     <string name="engine_notif_connected">已连接 · 等待传输任务</string>
     <string name="engine_notif_transferring">正在高速传输文件…</string>
+    <string name="scan_qr_pair">扫码绑定电脑</string>
+    <string name="qr_scan_hint">将电脑通知栏上的二维码放入框内</string>
+    <string name="qr_scan_recognized_title">已识别：%1$s</string>
+    <string name="qr_scan_recognized_subtitle">正在绑定并建立连接…</string>
+    <string name="qr_scan_pair_succeeded">绑定成功：%1$s</string>
+    <string name="qr_scan_pair_failed">绑定失败：%1$s</string>
+    <string name="qr_scan_invalid_code">非多轨快传配对二维码，请重新对准</string>
+    <string name="qr_scan_camera_permission_needed">需要相机权限以扫描配对二维码</string>
 </resources>

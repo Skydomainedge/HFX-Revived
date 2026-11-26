@@ -102,4 +102,29 @@ public class PcShellCliTest {
         File regularFile = tempFolder.newFile("not_a_dir.txt");
         assertEquals("/", Main.resolveEffectiveHomeDir(regularFile.getAbsolutePath()));
     }
+
+    @Test
+    public void testM4ZeroConfigOptionsAndAntiCropWinToastXml() throws Exception {
+        CliOptions pairOpts = CliOptions.parse(new String[]{"--pair", "--no-toast"});
+        assertTrue(pairOpts.pairMode);
+        assertTrue(pairOpts.noToast);
+        assertFalse(pairOpts.autoMode);
+
+        CliOptions autoOpts = CliOptions.parse(new String[]{"--auto"});
+        assertTrue(autoOpts.autoMode);
+        assertFalse(autoOpts.pairMode);
+
+        File fakePng = tempFolder.newFile("pair_test1234.png");
+        String xml = WinToastFallback.buildQrToastXml(
+                fakePng.getAbsolutePath(), "OMEN-8-Plus",
+                java.util.Arrays.asList("10.94.81.203", "192.168.50.236"), 120);
+        assertFalse("Win11 Toast XML MUST NEVER use placement=\"hero\" (crops QR codes!)",
+                xml.toLowerCase().contains("placement=\"hero\""));
+        assertTrue("Win11 Toast XML must use ToastGeneric template",
+                xml.contains("template=\"ToastGeneric\""));
+        assertTrue("Win11 Toast XML must use inline hint-crop=\"none\"",
+                xml.contains("hint-crop=\"none\""));
+        assertTrue("Win11 Toast XML must reference file:/// URI",
+                xml.contains("src=\"file:///"));
+    }
 }

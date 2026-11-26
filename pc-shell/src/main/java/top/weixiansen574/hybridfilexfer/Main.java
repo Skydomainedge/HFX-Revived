@@ -2,6 +2,8 @@ package top.weixiansen574.hybridfilexfer;
 
 import java.io.File;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
@@ -16,8 +18,9 @@ import top.weixiansen574.hybridfilexfer.pc.engine.adb.AdbManager;
  * Thin backwards-compatible CLI shell over headless {@link PcEngineRuntime}.
  *
  * <p>Preserves 100% compatibility with legacy {@code -c adb} / {@code -c <ip>} / {@code -d} /
- * {@code -s} and M2 {@code --adb-*} / {@code --no-auto-bind} flags while delegating all
- * transport, ADB, NIC, and state-machine logic to {@link PcEngineRuntime}.</p>
+ * {@code -s} and M2 {@code --adb-*} / {@code --no-auto-bind} flags while adding M4 zero-config
+ * {@code --auto} / {@code --pair} / no-args PNG QR discovery & Windows 11 Toast fallback
+ * (strictly zero ASCII console QR rendering).</p>
  */
 public class Main {
 
@@ -38,12 +41,13 @@ public class Main {
             return;
         }
 
-        if (opts.showHelp || opts.emptyArgs) {
+        if (opts.showHelp) {
             Strings.printf("help_pages");
             return;
         }
 
-        if (opts.connect == null || opts.connect.isEmpty()) {
+        boolean zeroConfigMode = opts.pairMode || opts.autoMode || (opts.emptyArgs && opts.connect == null);
+        if (!zeroConfigMode && (opts.connect == null || opts.connect.isEmpty())) {
             System.err.println(Strings.get("control_chanel_null"));
             Strings.printf("see_help");
             return;
@@ -52,12 +56,18 @@ public class Main {
         PcEngineRuntime.EngineConfig engineConfig = new PcEngineRuntime.EngineConfig();
         engineConfig.adbConfig = buildAdbConfig(opts);
         engineConfig.defaultAutoSubnetBind = !opts.disableAutoBind;
+        engineConfig.enableMdns = zeroConfigMode;
 
         try (PcEngineRuntime runtime = new PcEngineRuntime(engineConfig)) {
             Thread cliShutdownHook = new Thread(runtime::shutdown, "hfx-cli-shutdown");
             Runtime.getRuntime().addShutdownHook(cliShutdownHook);
 
-            runtime.addEventListener(Main::handleEngineEvent);
+            if (zeroConfigMode) {
+                runZeroConfigOrPairMode(runtime, opts, cliShutdownHook);
+                return;
+            }
+
+            runtime.addEventListener((eventName, payload) -> handleEngineEvent(eventName, payload, opts.noToast));
 
             IpcPayloads.SessionConnectParams connectParams = new IpcPayloads.SessionConnectParams();
             if ("adb".equalsIgnoreCase(opts.connect)) {
@@ -98,8 +108,109 @@ public class Main {
         }
     }
 
-    private static void handleEngineEvent(String eventName, Object payload) {
-        if (IpcEvents.ADB_VERSION_WARNING.equals(eventName)
+    private static void runZeroConfigOrPairMode(PcEngineRuntime runtime,
+                                                CliOptions opts,
+                                                Thread shutdownHook) throws Exception {
+        final CountDownLatch flowDone = new CountDownLatch(1);
+        final AtomicBoolean connected = new AtomicBoolean(false);
+
+        runtime.addEventListener((eventName, payload) -> {
+            handleEngineEvent(eventName, payload, opts.noToast);
+            if (IpcEvents.SESSION_STATE_CHANGED.equals(eventName)
+                    && payload instanceof IpcPayloads.SessionStateChangedPayload) {
+                IpcPayloads.SessionStateChangedPayload sc = (IpcPayloads.SessionStateChangedPayload) payload;
+                if (sc.current == SessionState.CONNECTED) {
+                    connected.set(true);
+                    flowDone.countDown();
+                }
+            } else if (IpcEvents.PAIR_EXPIRED.equals(eventName) || IpcEvents.PAIR_FAILED.equals(eventName)) {
+                if (!connected.get()) {
+                    flowDone.countDown();
+                }
+            }
+        });
+
+        String resolvedHomeDir = resolveEffectiveHomeDir(opts.homeDir);
+        boolean autoConnected = false;
+
+        if (!opts.pairMode) {
+            System.out.println("[mDNS] Searching for trusted devices on local USB/LAN interfaces...");
+            IpcPayloads.SessionConnectParams autoParams = new IpcPayloads.SessionConnectParams();
+            autoParams.mode = "auto";
+            autoParams.homeDir = resolvedHomeDir;
+            autoParams.autoSubnetBind = !opts.disableAutoBind;
+            try {
+                runtime.connect(autoParams);
+                autoConnected = true;
+                connected.set(true);
+                Strings.printf("connect_success");
+            } catch (PcEngineRuntime.EngineException ignored) {
+                System.out.println("[mDNS] No trusted device discovered nearby; starting PNG QR pairing...");
+            }
+        }
+
+        if (!autoConnected) {
+            IpcPayloads.PairStartParams pairParams = new IpcPayloads.PairStartParams();
+            pairParams.ttlSeconds = ProtocolConstants.DEFAULT_PAIR_TTL_SECONDS;
+            pairParams.pngSize = ProtocolConstants.DEFAULT_QR_PNG_SIZE;
+            try {
+                runtime.startQrPairing(pairParams);
+            } catch (PcEngineRuntime.EngineException e) {
+                System.err.println("[ERROR] " + e.getMessage());
+                removeShutdownHookQuietly(shutdownHook);
+                return;
+            }
+            flowDone.await();
+        }
+
+        if (connected.get()) {
+            runtime.awaitSessionEnd();
+        }
+        removeShutdownHookQuietly(shutdownHook);
+    }
+
+    private static void handleEngineEvent(String eventName, Object payload, boolean noToast) {
+        if (IpcEvents.PAIR_QR_READY.equals(eventName)
+                && payload instanceof IpcPayloads.PairQrReadyPayload) {
+            IpcPayloads.PairQrReadyPayload qr = (IpcPayloads.PairQrReadyPayload) payload;
+            System.out.println("============================================================");
+            System.out.println("  HybridFileXfer QR Pairing Ready (120s)");
+            System.out.println("  QR PNG : " + qr.qrPngPath);
+            System.out.println("  IPs    : " + String.join(", ", qr.ips));
+            System.out.println("  Port   : " + qr.port);
+            System.out.println("============================================================");
+            if (!noToast && WinToastFallback.isWindows()) {
+                String xml = WinToastFallback.buildQrToastXml(
+                        qr.qrPngPath, qr.hostName, qr.ips, ProtocolConstants.DEFAULT_PAIR_TTL_SECONDS);
+                boolean shown = WinToastFallback.showToastOnWindows(xml);
+                if (shown) {
+                    System.out.println("[Toast] Pushed Windows 11 notification with uncropped QR PNG.");
+                } else {
+                    System.out.println("[Hint] Open the PNG image above and scan it with the mobile app.");
+                }
+            } else {
+                System.out.println("[Hint] Open the PNG image above and scan it with the mobile app.");
+            }
+        } else if (IpcEvents.PAIR_SUCCEEDED.equals(eventName)
+                && payload instanceof IpcPayloads.PairSucceededPayload) {
+            IpcPayloads.PairSucceededPayload ok = (IpcPayloads.PairSucceededPayload) payload;
+            System.out.println("[PAIR] Paired with " + ok.peerName + " (" + ok.peerId
+                    + ", viaFallbackMdns=" + ok.viaFallbackMdns + ")");
+            if (!noToast && WinToastFallback.isWindows()) {
+                WinToastFallback.showToastOnWindows(WinToastFallback.buildStatusToastXml(
+                        "HybridFileXfer · 绑定成功",
+                        "已绑定 " + ok.peerName + (ok.viaFallbackMdns ? "（mDNS 反向兜底）" : "")));
+            }
+        } else if ((IpcEvents.PAIR_EXPIRED.equals(eventName) || IpcEvents.PAIR_FAILED.equals(eventName))
+                && payload instanceof IpcPayloads.PairErrorPayload) {
+            IpcPayloads.PairErrorPayload err = (IpcPayloads.PairErrorPayload) payload;
+            System.err.println("[PAIR][" + err.code + "] " + err.reason);
+        } else if (IpcEvents.MDNS_PEER_DISCOVERED.equals(eventName)
+                && payload instanceof IpcDtos.PeerInfo) {
+            IpcDtos.PeerInfo peer = (IpcDtos.PeerInfo) payload;
+            System.out.println("[mDNS] Found " + peer.deviceName + " " + peer.ips
+                    + " (trusted=" + peer.trusted + ")");
+        } else if (IpcEvents.ADB_VERSION_WARNING.equals(eventName)
                 && payload instanceof IpcPayloads.DiagnosticWarningPayload) {
             IpcPayloads.DiagnosticWarningPayload warn = (IpcPayloads.DiagnosticWarningPayload) payload;
             System.err.println("[WARN][" + warn.code + "] " + warn.message);
@@ -128,7 +239,8 @@ public class Main {
                     Strings.printf("sending_files");
                 }
             } else if (sc.current == SessionState.IDLE && sc.prev != SessionState.IDLE
-                    && sc.prev != SessionState.CONNECTING) {
+                    && sc.prev != SessionState.CONNECTING && sc.prev != SessionState.PAIRING
+                    && sc.prev != SessionState.DISCOVERING) {
                 Strings.printf("client_exit");
             }
         } else if (IpcEvents.TRANSFER_PROGRESS.equals(eventName)

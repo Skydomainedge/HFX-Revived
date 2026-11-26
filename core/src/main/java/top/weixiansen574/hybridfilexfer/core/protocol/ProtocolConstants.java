@@ -13,6 +13,11 @@ public final class ProtocolConstants {
 
     public static final int DEFAULT_CONTROL_PORT = 5740;
     public static final int DEFAULT_PAIR_PORT = 5741;
+    public static final String MDNS_SERVICE_TYPE = "_hfx._tcp.local.";
+    public static final String MDNS_ANDROID_SERVICE_TYPE = "_hfx._tcp.";
+    public static final String PAIR_HTTP_PATH = "/hfx/pair";
+    public static final int DEFAULT_PAIR_TTL_SECONDS = 120;
+    public static final int DEFAULT_QR_PNG_SIZE = 480;
 
     public static final int MIN_BLOCK_SIZE = 256 * 1024;          // 256 KB
     public static final int DEFAULT_BLOCK_SIZE = 1024 * 1024;     // 1 MB

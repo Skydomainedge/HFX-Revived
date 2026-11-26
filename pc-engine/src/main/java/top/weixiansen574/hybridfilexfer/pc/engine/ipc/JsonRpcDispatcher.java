@@ -159,16 +159,26 @@ public class JsonRpcDispatcher {
                 case IpcMethods.TRANSFER_CANCEL:
                     return ok(id, runtime.cancelTransfer(), false);
 
-                case IpcMethods.PEERS_LIST:
-                    return ok(id, new IpcPayloads.PeersListResult(), false);
+                case IpcMethods.PAIR_START_QR: {
+                    IpcPayloads.PairStartParams params = decodeParams(req, IpcPayloads.PairStartParams.class);
+                    return ok(id, runtime.startQrPairing(params), false);
+                }
 
-                case IpcMethods.PEERS_REMOVE:
-                case IpcMethods.PAIR_START_QR:
                 case IpcMethods.PAIR_CANCEL:
+                    return ok(id, runtime.cancelPairing(), false);
+
+                case IpcMethods.PEERS_LIST:
+                    return ok(id, runtime.listTrustedPeers(), false);
+
+                case IpcMethods.PEERS_REMOVE: {
+                    IpcPayloads.PeerRemoveParams params = decodeParams(req, IpcPayloads.PeerRemoveParams.class);
+                    return ok(id, runtime.removeTrustedPeer(params), false);
+                }
+
                 case IpcMethods.PAIR_SUBMIT_QR_URI:
                     return new DispatchResult(
                             JsonRpcResponse.error(id, JsonRpcError.METHOD_NOT_FOUND,
-                                    "Method scheduled for M4 (mDNS/QR pairing): " + method),
+                                    "Method is only supported on Android engine: " + method),
                             false);
 
                 default:

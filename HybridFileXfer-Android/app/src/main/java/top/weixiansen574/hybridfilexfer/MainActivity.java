@@ -199,6 +199,21 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             }
         } else if (IpcEvents.RAIL_CONFLICT_RESOLVED.equals(eventName)) {
             lastConflict = IpcJson.fromJson(payloadJson, IpcPayloads.RailConflictResolvedPayload.class);
+        } else if (IpcEvents.PAIR_SUCCEEDED.equals(eventName)) {
+            IpcPayloads.PairSucceededPayload ok = IpcJson.fromJson(
+                    payloadJson, IpcPayloads.PairSucceededPayload.class);
+            if (ok != null) {
+                String peerLabel = ok.peerName != null ? ok.peerName : ok.peerId;
+                Toast.makeText(context, getString(R.string.qr_scan_pair_succeeded, peerLabel),
+                        Toast.LENGTH_SHORT).show();
+            }
+        } else if (IpcEvents.PAIR_FAILED.equals(eventName)) {
+            IpcPayloads.PairErrorPayload err = IpcJson.fromJson(
+                    payloadJson, IpcPayloads.PairErrorPayload.class);
+            if (err != null) {
+                Toast.makeText(context, getString(R.string.qr_scan_pair_failed,
+                        err.reason != null ? err.reason : err.code), Toast.LENGTH_LONG).show();
+            }
         } else if (IpcEvents.DIAGNOSTIC_WARNING.equals(eventName)) {
             IpcPayloads.DiagnosticWarningPayload warn = IpcJson.fromJson(
                     payloadJson, IpcPayloads.DiagnosticWarningPayload.class);
@@ -372,7 +387,15 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
     @Override
     public boolean onOptionsItemSelected(@NonNull MenuItem item) {
         int itemId = item.getItemId();
-        if (itemId == R.id.github) {
+        if (itemId == R.id.action_scan_qr) {
+            if (checkPermissionOrRequest()) {
+                Toast.makeText(context, R.string.xu_yao_wen_jian_du_xie_quan_xian, Toast.LENGTH_LONG).show();
+                return true;
+            }
+            startActivity(new Intent(context, QrScanActivity.class));
+            overridePendingTransition(R.anim.hfx_slide_in_right, R.anim.hfx_fade_out);
+            return true;
+        } else if (itemId == R.id.github) {
             Intent intent = new Intent(Intent.ACTION_VIEW);
             intent.setData(Uri.parse("https://github.com/weixiansen574/HybridFileXfer"));
             startActivity(intent);

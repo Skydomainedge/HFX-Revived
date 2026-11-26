@@ -3,12 +3,12 @@ package top.weixiansen574.hybridfilexfer.pc.engine;
 import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -18,7 +18,6 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
-import top.weixiansen574.hybridfilexfer.core.HFXClient;
 import top.weixiansen574.hybridfilexfer.core.HFXService;
 import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.bean.Directory;
@@ -35,24 +34,26 @@ import top.weixiansen574.hybridfilexfer.core.ipc.SessionState;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
 import top.weixiansen574.hybridfilexfer.jdkcore.JdkHFXClient;
 import top.weixiansen574.hybridfilexfer.pc.engine.adb.AdbManager;
+import top.weixiansen574.hybridfilexfer.pc.engine.discovery.MdnsManager;
 import top.weixiansen574.hybridfilexfer.pc.engine.discovery.NicSelector;
+import top.weixiansen574.hybridfilexfer.pc.engine.discovery.PairingServer;
+import top.weixiansen574.hybridfilexfer.pc.engine.discovery.QrImageGenerator;
+import top.weixiansen574.hybridfilexfer.pc.engine.discovery.TrustedPeerStore;
 import top.weixiansen574.hybridfilexfer.pc.engine.transport.SubnetBindResolver;
 
 /**
- * Headless PC engine runtime implementing the full M3 state machine and orchestrating
- * {@link AdbManager}, {@link NicSelector}, {@link SubnetBindResolver}, and {@link JdkHFXClient}.
+ * Headless PC engine runtime implementing the full M3+M4 state machine and orchestrating
+ * {@link AdbManager}, {@link NicSelector}, {@link SubnetBindResolver}, {@link MdnsManager},
+ * {@link PairingServer}, {@link QrImageGenerator}, {@link TrustedPeerStore}, and {@link JdkHFXClient}.
  *
  * <p>Architecture red line: strictly zero UI / Swing / AWT / Android / {@code PrintStream} references.
- * All state transitions, diagnostics, rail updates, and 250ms-throttled transfer progress are emitted
- * solely as structured IPC events to registered {@link EventListener}s.</p>
+ * All state transitions, discovery updates, QR readiness, diagnostics, rail updates, and
+ * 250ms-throttled transfer progress are emitted solely as structured IPC events.</p>
  */
 public class PcEngineRuntime implements AutoCloseable {
 
     public static final long DEFAULT_PROGRESS_THROTTLE_MS = 250L;
 
-    /**
-     * Structured runtime error carrying a JSON-RPC error code.
-     */
     public static final class EngineException extends Exception {
         public final int errorCode;
 
@@ -67,25 +68,16 @@ public class PcEngineRuntime implements AutoCloseable {
         }
     }
 
-    /**
-     * Event subscriber interface for IPC transports and thin shells.
-     */
     @FunctionalInterface
     public interface EventListener {
         void onEvent(String eventName, Object payload);
     }
 
-    /**
-     * Injectable factory for {@link AdbManager} to support deterministic unit testing.
-     */
     @FunctionalInterface
     public interface AdbManagerFactory {
         AdbManager create(AdbManager.AdbConfig config, AdbManager.DiagnosticListener listener);
     }
 
-    /**
-     * Tunable runtime configuration preserving defaults while keeping knobs user-configurable.
-     */
     public static final class EngineConfig {
         public String deviceId;
         public String deviceName;
@@ -93,6 +85,17 @@ public class PcEngineRuntime implements AutoCloseable {
         public boolean defaultAutoSubnetBind = true;
         public AdbManager.AdbConfig adbConfig = new AdbManager.AdbConfig();
         public NicSelector.NicSelectorConfig nicSelectorConfig = new NicSelector.NicSelectorConfig();
+
+        // M4 discovery, QR PNG & pairing configuration
+        public Path trustedPeersPath;
+        public Path qrTempDir;
+        public int preferredPairPort = ProtocolConstants.DEFAULT_PAIR_PORT;
+        public boolean enableMdns = true;
+        public boolean autoConnectOnPair = true;
+        public boolean autoConnectTrustedPeers = false;
+        public long autoConnectDiscoveryWaitMs = 2000L;
+        public boolean simulateBlockedPairPortForTest = false;
+        public List<String> overrideQrCandidateIps;
 
         public EngineConfig() {
         }
@@ -107,6 +110,16 @@ public class PcEngineRuntime implements AutoCloseable {
             c.nicSelectorConfig = this.nicSelectorConfig != null
                     ? this.nicSelectorConfig.copy()
                     : new NicSelector.NicSelectorConfig();
+            c.trustedPeersPath = this.trustedPeersPath;
+            c.qrTempDir = this.qrTempDir;
+            c.preferredPairPort = this.preferredPairPort;
+            c.enableMdns = this.enableMdns;
+            c.autoConnectOnPair = this.autoConnectOnPair;
+            c.autoConnectTrustedPeers = this.autoConnectTrustedPeers;
+            c.autoConnectDiscoveryWaitMs = Math.max(0L, this.autoConnectDiscoveryWaitMs);
+            c.simulateBlockedPairPortForTest = this.simulateBlockedPairPortForTest;
+            c.overrideQrCandidateIps = this.overrideQrCandidateIps != null
+                    ? new ArrayList<>(this.overrideQrCandidateIps) : null;
             return c;
         }
     }
@@ -117,11 +130,22 @@ public class PcEngineRuntime implements AutoCloseable {
     private final NicSelector nicSelector;
     private final SubnetBindResolver subnetBindResolver;
     private final AdbManagerFactory adbManagerFactory;
+    private final TrustedPeerStore trustedPeerStore;
+    private final QrImageGenerator qrImageGenerator;
+    private final MdnsManager mdnsManager;
+    private final PairingServer pairingServer;
 
     private final CopyOnWriteArrayList<EventListener> listeners = new CopyOnWriteArrayList<>();
     private final Object lifecycleLock = new Object();
+    private final Object discoveryMonitor = new Object();
+
     private final ExecutorService transferExecutor = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "hfx-pc-transfer");
+        t.setDaemon(true);
+        return t;
+    });
+    private final ExecutorService connectExecutor = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "hfx-pc-pair-connect");
         t.setDaemon(true);
         return t;
     });
@@ -138,21 +162,28 @@ public class PcEngineRuntime implements AutoCloseable {
     private final AtomicBoolean closed = new AtomicBoolean(false);
 
     public PcEngineRuntime() {
-        this(new EngineConfig(), null, null, null);
+        this(new EngineConfig(), null, null, null, null);
     }
 
     public PcEngineRuntime(EngineConfig config) {
-        this(config, null, null, null);
+        this(config, null, null, null, null);
     }
 
     public PcEngineRuntime(EngineConfig config,
                            NicSelector nicSelector,
                            SubnetBindResolver subnetBindResolver,
                            AdbManagerFactory adbManagerFactory) {
+        this(config, nicSelector, subnetBindResolver, adbManagerFactory, null);
+    }
+
+    public PcEngineRuntime(EngineConfig config,
+                           NicSelector nicSelector,
+                           SubnetBindResolver subnetBindResolver,
+                           AdbManagerFactory adbManagerFactory,
+                           MdnsManager.MdnsBindingFactory mdnsBindingFactory) {
         this.config = config != null ? config.copy() : new EngineConfig();
-        this.deviceId = (this.config.deviceId != null && !this.config.deviceId.trim().isEmpty())
-                ? this.config.deviceId.trim()
-                : UUID.randomUUID().toString();
+        this.trustedPeerStore = new TrustedPeerStore(this.config.trustedPeersPath);
+        this.deviceId = this.trustedPeerStore.getOrCreatePcDeviceId(this.config.deviceId);
         this.deviceName = resolveDeviceName(this.config.deviceName);
         this.nicSelector = nicSelector != null ? nicSelector : new NicSelector(this.config.nicSelectorConfig);
         this.subnetBindResolver = subnetBindResolver != null
@@ -161,7 +192,157 @@ public class PcEngineRuntime implements AutoCloseable {
         this.adbManagerFactory = adbManagerFactory != null
                 ? adbManagerFactory
                 : (adbCfg, diag) -> new AdbManager(adbCfg, diag);
+        this.qrImageGenerator = new QrImageGenerator(this.config.qrTempDir);
+        this.pairingServer = new PairingServer(
+                this.qrImageGenerator,
+                this.trustedPeerStore,
+                this.config.preferredPairPort,
+                this.config.simulateBlockedPairPortForTest);
+        this.mdnsManager = mdnsBindingFactory != null
+                ? new MdnsManager(this.nicSelector, this.trustedPeerStore, this.deviceName, mdnsBindingFactory)
+                : new MdnsManager(this.nicSelector, this.trustedPeerStore, this.deviceName);
+
         this.cachedNics = this.nicSelector.selectLocalNics();
+
+        wireDiscoveryAndPairingCallbacks();
+        if (this.config.enableMdns) {
+            this.mdnsManager.start();
+        }
+    }
+
+    private void wireDiscoveryAndPairingCallbacks() {
+        this.pairingServer.setListener(new PairingServer.PairingListener() {
+            @Override
+            public void onPairingCompleted(IpcDtos.PeerInfo peer, byte[] pairSecret, boolean viaFallbackMdns) {
+                mdnsManager.refreshTrustedStatus();
+                if (!viaFallbackMdns) {
+                    emitPairSucceeded(peer, false);
+                    if (config.autoConnectOnPair) {
+                        connectExecutor.submit(() -> autoConnectAfterPairing(peer, pairSecret, false));
+                    } else if (state == SessionState.PAIRING) {
+                        transitionState(SessionState.IDLE, "Paired with " + peer.deviceName);
+                    }
+                } else {
+                    // Firewall reverse-fallback: outbound HFXC + HMAC connection proves peer identity
+                    if (config.autoConnectOnPair) {
+                        connectExecutor.submit(() -> autoConnectAfterPairing(peer, pairSecret, true));
+                    } else {
+                        emitPairSucceeded(peer, true);
+                        if (state == SessionState.PAIRING) {
+                            transitionState(SessionState.IDLE, "Paired via mDNS fallback with " + peer.deviceName);
+                        }
+                    }
+                }
+            }
+
+            @Override
+            public void onPairingExpired(String reason) {
+                if (state == SessionState.PAIRING) {
+                    transitionState(SessionState.IDLE, reason);
+                }
+                emitEvent(IpcEvents.PAIR_EXPIRED, new IpcPayloads.PairErrorPayload("PAIR_EXPIRED", reason));
+            }
+
+            @Override
+            public void onPairingFailed(String code, String reason) {
+                emitEvent(IpcEvents.PAIR_FAILED, new IpcPayloads.PairErrorPayload(code, reason));
+            }
+        });
+
+        this.mdnsManager.addListener(new MdnsManager.PeerDiscoveryListener() {
+            @Override
+            public void onPeerDiscovered(IpcDtos.PeerInfo peer, String pairAck) {
+                emitEvent(IpcEvents.MDNS_PEER_DISCOVERED, peer);
+                synchronized (discoveryMonitor) {
+                    discoveryMonitor.notifyAll();
+                }
+                if (pairAck != null && !pairAck.isEmpty() && pairingServer.isPairingActive()) {
+                    if (pairingServer.onMdnsPairAckObserved(peer, pairAck)) {
+                        return;
+                    }
+                }
+                if (peer.trusted && config.autoConnectTrustedPeers && !closed.get()) {
+                    SessionState cur = state;
+                    if (cur == SessionState.IDLE || cur == SessionState.DISCOVERING) {
+                        connectExecutor.submit(() -> {
+                            SessionState recheck = state;
+                            if (recheck == SessionState.IDLE || recheck == SessionState.DISCOVERING) {
+                                IpcPayloads.SessionConnectParams params = new IpcPayloads.SessionConnectParams();
+                                params.mode = "auto";
+                                params.deviceId = peer.deviceId;
+                                params.port = peer.port;
+                                params.homeDir = effectiveHomeDir;
+                                try {
+                                    connect(params);
+                                } catch (Exception ignored) {
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+
+            @Override
+            public void onPeerLost(IpcDtos.PeerInfo peer) {
+                emitEvent(IpcEvents.MDNS_PEER_LOST, peer);
+            }
+        });
+    }
+
+    private void autoConnectAfterPairing(IpcDtos.PeerInfo peer, byte[] pairSecret, boolean viaFallbackMdns) {
+        List<String> rankedIps = mdnsManager.rankPeerIps(peer.ips);
+        if (rankedIps.isEmpty()) {
+            if (viaFallbackMdns) {
+                emitEvent(IpcEvents.PAIR_FAILED, new IpcPayloads.PairErrorPayload(
+                        "NO_PEER_IPS", "No reachable IPs advertised by peer for outbound fallback"));
+            }
+            if (state == SessionState.PAIRING) {
+                transitionState(SessionState.IDLE, "No peer IPs available");
+            }
+            return;
+        }
+        IpcPayloads.SessionConnectParams params = new IpcPayloads.SessionConnectParams();
+        params.mode = "direct";
+        params.deviceId = peer.deviceId;
+        params.port = peer.port > 0 ? peer.port : ProtocolConstants.DEFAULT_CONTROL_PORT;
+        params.homeDir = effectiveHomeDir;
+        params.autoSubnetBind = config.defaultAutoSubnetBind;
+
+        String lastErr = null;
+        for (String candidateIp : rankedIps) {
+            if (closed.get()) {
+                return;
+            }
+            params.host = candidateIp;
+            try {
+                connectInternal(params, pairSecret, true);
+                if (viaFallbackMdns) {
+                    emitPairSucceeded(peer, true);
+                }
+                return;
+            } catch (EngineException e) {
+                lastErr = e.getMessage();
+            }
+        }
+
+        if (viaFallbackMdns) {
+            emitEvent(IpcEvents.PAIR_FAILED, new IpcPayloads.PairErrorPayload(
+                    "FALLBACK_CONNECT_FAILED",
+                    lastErr != null ? lastErr : "Failed to connect outbound after mDNS pair_ack"));
+        } else {
+            emitEvent(IpcEvents.DIAGNOSTIC_WARNING, new IpcPayloads.DiagnosticWarningPayload(
+                    "POST_PAIR_CONNECT_FAILED",
+                    lastErr != null ? lastErr : "Paired successfully, but automatic connect failed"));
+        }
+    }
+
+    private void emitPairSucceeded(IpcDtos.PeerInfo peer, boolean viaFallbackMdns) {
+        IpcPayloads.PairSucceededPayload payload = new IpcPayloads.PairSucceededPayload();
+        payload.peerId = peer.deviceId;
+        payload.peerName = peer.deviceName;
+        payload.controlIps = peer.ips != null ? new ArrayList<>(peer.ips) : new ArrayList<>();
+        payload.viaFallbackMdns = viaFallbackMdns;
+        emitEvent(IpcEvents.PAIR_SUCCEEDED, payload);
     }
 
     private static String resolveDeviceName(String configured) {
@@ -199,8 +380,28 @@ public class PcEngineRuntime implements AutoCloseable {
         return deviceId;
     }
 
+    public String getDeviceName() {
+        return deviceName;
+    }
+
     public EngineConfig getConfig() {
         return config.copy();
+    }
+
+    public TrustedPeerStore getTrustedPeerStore() {
+        return trustedPeerStore;
+    }
+
+    public MdnsManager getMdnsManager() {
+        return mdnsManager;
+    }
+
+    public QrImageGenerator getQrImageGenerator() {
+        return qrImageGenerator;
+    }
+
+    public PairingServer getPairingServer() {
+        return pairingServer;
     }
 
     public IpcDtos.EngineSnapshot getSnapshot() {
@@ -214,6 +415,8 @@ public class PcEngineRuntime implements AutoCloseable {
         snapshot.adb = this.lastAdbCapability;
         snapshot.nics = new ArrayList<>(this.cachedNics);
         snapshot.rails = new ArrayList<>(this.activeRails);
+        snapshot.trustedPeers = trustedPeerStore.listPeers();
+        snapshot.discoveredPeers = mdnsManager.getDiscoveredPeers();
         snapshot.remoteHomeDir = this.effectiveHomeDir;
         snapshot.remoteFileSystem = Directory.getCurrentFileSystem();
         return snapshot;
@@ -222,23 +425,236 @@ public class PcEngineRuntime implements AutoCloseable {
     public IpcPayloads.NicsRefreshResult refreshNics() {
         List<IpcDtos.NicInfo> nics = nicSelector.selectLocalNics();
         this.cachedNics = nics;
+        if (this.config.enableMdns) {
+            this.mdnsManager.refreshBindings(nics);
+        }
         IpcPayloads.NicsRefreshResult res = new IpcPayloads.NicsRefreshResult();
         res.nics = new ArrayList<>(nics);
         return res;
     }
+
+    // ---- M4 Pairing & Trusted Peer Management ----
+
+    public IpcPayloads.PairQrReadyPayload startQrPairing(IpcPayloads.PairStartParams params) throws EngineException {
+        if (closed.get()) {
+            throw new EngineException(JsonRpcError.INVALID_STATE, "Engine is shut down");
+        }
+        synchronized (lifecycleLock) {
+            if (state == SessionState.CONNECTED || state == SessionState.TRANSFERRING
+                    || state == SessionState.CONNECTING) {
+                throw new EngineException(JsonRpcError.INVALID_STATE,
+                        "Cannot start QR pairing while state is " + state);
+            }
+        }
+        IpcPayloads.PairStartParams p = params != null ? params : new IpcPayloads.PairStartParams();
+        int ttl = p.ttlSeconds > 0 ? p.ttlSeconds : ProtocolConstants.DEFAULT_PAIR_TTL_SECONDS;
+        int pngSize = p.pngSize > 0 ? p.pngSize : QrImageGenerator.DEFAULT_SIZE_PX;
+
+        List<String> candidateIps = resolveQrCandidateIps();
+        if (candidateIps.isEmpty()) {
+            throw new EngineException(JsonRpcError.IO_ERROR,
+                    "No eligible local IPv4 network interface available for QR pairing");
+        }
+
+        try {
+            IpcPayloads.PairQrReadyPayload qrReady = pairingServer.startPairing(
+                    this.deviceId, this.deviceName, candidateIps, ttl, pngSize);
+            transitionState(SessionState.PAIRING, "Waiting for QR scan on port " + qrReady.port);
+            emitEvent(IpcEvents.PAIR_QR_READY, qrReady);
+            return qrReady;
+        } catch (IOException e) {
+            throw new EngineException(JsonRpcError.IO_ERROR, "Failed to start QR pairing: " + e.getMessage(), e);
+        }
+    }
+
+    public IpcPayloads.OkResult cancelPairing() {
+        boolean hadActive = pairingServer.cancelPairing();
+        if (state == SessionState.PAIRING) {
+            transitionState(SessionState.IDLE, "Pairing cancelled");
+        }
+        return new IpcPayloads.OkResult(true, hadActive ? "Pairing cancelled" : "No active pairing");
+    }
+
+    public IpcPayloads.PeersListResult listTrustedPeers() {
+        IpcPayloads.PeersListResult result = new IpcPayloads.PeersListResult();
+        result.peers = trustedPeerStore.listPeers();
+        return result;
+    }
+
+    public IpcPayloads.OkResult removeTrustedPeer(IpcPayloads.PeerRemoveParams params) throws EngineException {
+        if (params == null || params.deviceId == null || params.deviceId.trim().isEmpty()) {
+            throw new EngineException(JsonRpcError.INVALID_PARAMS, "deviceId is required");
+        }
+        try {
+            boolean removed = trustedPeerStore.removePeer(params.deviceId.trim());
+            mdnsManager.refreshTrustedStatus();
+            return new IpcPayloads.OkResult(removed, removed ? "Peer removed" : "Peer not found");
+        } catch (IOException e) {
+            throw new EngineException(JsonRpcError.IO_ERROR, "Failed to remove peer: " + e.getMessage(), e);
+        }
+    }
+
+    private List<String> resolveQrCandidateIps() {
+        if (config.overrideQrCandidateIps != null && !config.overrideQrCandidateIps.isEmpty()) {
+            return new ArrayList<>(config.overrideQrCandidateIps);
+        }
+        List<IpcDtos.NicInfo> nics = nicSelector.selectLocalNics();
+        this.cachedNics = nics;
+        if (this.config.enableMdns) {
+            this.mdnsManager.refreshBindings(nics);
+        }
+        List<String> ips = new ArrayList<>();
+        for (IpcDtos.NicInfo nic : nics) {
+            if (nic.ip != null && !nic.ip.trim().isEmpty() && !ips.contains(nic.ip.trim())) {
+                ips.add(nic.ip.trim());
+                if (ips.size() >= 4) {
+                    // Keep QR payload compact and high-recognition (USB NIC > ETH > Wi-Fi)
+                    break;
+                }
+            }
+        }
+        return ips;
+    }
+
+    // ---- Session Connection ----
 
     public IpcPayloads.OkResult connect(IpcPayloads.SessionConnectParams params) throws EngineException {
         if (closed.get()) {
             throw new EngineException(JsonRpcError.INVALID_STATE, "Engine is shut down");
         }
         IpcPayloads.SessionConnectParams p = params != null ? params : new IpcPayloads.SessionConnectParams();
+        String rawMode = p.mode != null ? p.mode.trim().toLowerCase() : "auto";
+
+        if ("auto".equals(rawMode) && (p.host == null || p.host.trim().isEmpty())) {
+            return connectAutoViaMdns(p);
+        }
+
+        byte[] pairSecret = resolvePairSecretForParams(p, rawMode);
+        return connectInternal(p, pairSecret, false);
+    }
+
+    private IpcPayloads.OkResult connectAutoViaMdns(IpcPayloads.SessionConnectParams p) throws EngineException {
+        synchronized (lifecycleLock) {
+            if (state != SessionState.IDLE && state != SessionState.ERROR && state != SessionState.DISCOVERING) {
+                throw new EngineException(JsonRpcError.INVALID_STATE,
+                        "Cannot auto-connect while state is " + state);
+            }
+            transitionState(SessionState.DISCOVERING, "Discovering trusted peer via mDNS");
+        }
+
+        IpcDtos.PeerInfo peer = waitForTrustedPeer(p.deviceId, config.autoConnectDiscoveryWaitMs);
+        List<String> candidateIps = new ArrayList<>();
+        int targetPort = p.port > 0 ? p.port : ProtocolConstants.DEFAULT_CONTROL_PORT;
+        String targetDeviceId = p.deviceId;
+        byte[] pairSecret = null;
+
+        if (peer != null) {
+            targetDeviceId = peer.deviceId;
+            if (peer.port > 0) {
+                targetPort = peer.port;
+            }
+            candidateIps.addAll(mdnsManager.rankPeerIps(peer.ips));
+            pairSecret = trustedPeerStore.getPairSecret(peer.deviceId);
+        } else if (p.deviceId != null && !p.deviceId.trim().isEmpty()) {
+            TrustedPeerStore.TrustedPeerRecord stored = trustedPeerStore.getPeer(p.deviceId.trim());
+            if (stored != null && !stored.lastIps.isEmpty()) {
+                targetDeviceId = stored.deviceId;
+                targetPort = stored.port;
+                candidateIps.addAll(mdnsManager.rankPeerIps(stored.lastIps));
+                pairSecret = trustedPeerStore.getPairSecret(stored.deviceId);
+            }
+        }
+
+        if (candidateIps.isEmpty()) {
+            transitionState(SessionState.IDLE, "No trusted peer discovered via mDNS");
+            throw new EngineException(JsonRpcError.CONNECTION_FAILED,
+                    "No trusted peer discovered via mDNS (run pair.start_qr to pair a new device)");
+        }
+
+        EngineException lastError = null;
+        for (String ip : candidateIps) {
+            IpcPayloads.SessionConnectParams attempt = new IpcPayloads.SessionConnectParams();
+            attempt.mode = "direct";
+            attempt.host = ip;
+            attempt.port = targetPort;
+            attempt.deviceId = targetDeviceId;
+            attempt.homeDir = p.homeDir;
+            attempt.autoSubnetBind = p.autoSubnetBind;
+            try {
+                return connectInternal(attempt, pairSecret, true);
+            } catch (EngineException e) {
+                lastError = e;
+            }
+        }
+        throw lastError != null ? lastError
+                : new EngineException(JsonRpcError.CONNECTION_FAILED, "Failed to connect to discovered peer");
+    }
+
+    private IpcDtos.PeerInfo waitForTrustedPeer(String preferredDeviceId, long timeoutMs) {
+        IpcDtos.PeerInfo immediate = mdnsManager.findBestTrustedPeer(preferredDeviceId);
+        if (immediate != null || timeoutMs <= 0L) {
+            return immediate;
+        }
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        synchronized (discoveryMonitor) {
+            while (!closed.get()) {
+                IpcDtos.PeerInfo found = mdnsManager.findBestTrustedPeer(preferredDeviceId);
+                if (found != null) {
+                    return found;
+                }
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0L) {
+                    return null;
+                }
+                try {
+                    discoveryMonitor.wait(Math.min(200L, remaining));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    private byte[] resolvePairSecretForParams(IpcPayloads.SessionConnectParams p, String rawMode) {
+        if (p.deviceId != null && !p.deviceId.trim().isEmpty()) {
+            byte[] byId = trustedPeerStore.getPairSecret(p.deviceId.trim());
+            if (byId != null) {
+                return byId;
+            }
+        }
+        if (p.host != null && !p.host.trim().isEmpty() && !"adb".equalsIgnoreCase(p.host.trim())) {
+            TrustedPeerStore.TrustedPeerRecord byIp = trustedPeerStore.findByIp(p.host.trim());
+            if (byIp != null) {
+                return trustedPeerStore.getPairSecret(byIp.deviceId);
+            }
+        }
+        if ("adb".equals(rawMode) || "adb".equalsIgnoreCase(p.host)) {
+            TrustedPeerStore.TrustedPeerRecord single = trustedPeerStore.getSinglePeerIfUnique();
+            if (single != null) {
+                return trustedPeerStore.getPairSecret(single.deviceId);
+            }
+        }
+        return null;
+    }
+
+    private IpcPayloads.OkResult connectInternal(IpcPayloads.SessionConnectParams p,
+                                                 byte[] pairSecret,
+                                                 boolean allowFromPairingOrDiscovering) throws EngineException {
         String mode = normalizeConnectMode(p);
         int port = p.port > 0 ? p.port : ProtocolConstants.DEFAULT_CONTROL_PORT;
 
         synchronized (lifecycleLock) {
-            if (state != SessionState.IDLE && state != SessionState.ERROR) {
+            boolean allowed = (state == SessionState.IDLE || state == SessionState.ERROR)
+                    || (allowFromPairingOrDiscovering
+                        && (state == SessionState.PAIRING || state == SessionState.DISCOVERING));
+            if (!allowed) {
                 throw new EngineException(JsonRpcError.INVALID_STATE,
                         "Cannot connect while state is " + state);
+            }
+            if (!allowFromPairingOrDiscovering && pairingServer.isPairingActive()) {
+                pairingServer.cancelPairing();
             }
             transitionState(SessionState.CONNECTING, "Connecting (" + mode + ")");
         }
@@ -279,6 +695,9 @@ public class PcEngineRuntime implements AutoCloseable {
 
             client = new JdkHFXClient(serverAddress, port, resolvedHomeDir, subnetBindResolver);
             client.setClientId(this.deviceId);
+            if (pairSecret != null && pairSecret.length > 0) {
+                client.setPairSecret(pairSecret);
+            }
             if (requestedAdbStreams > 0) {
                 client.setRequestedAdbStreams(requestedAdbStreams);
             }
@@ -535,7 +954,14 @@ public class PcEngineRuntime implements AutoCloseable {
 
     public IpcPayloads.OkResult shutdown() {
         if (closed.compareAndSet(false, true)) {
+            synchronized (discoveryMonitor) {
+                discoveryMonitor.notifyAll();
+            }
+            pairingServer.close();
+            mdnsManager.close();
+            qrImageGenerator.close();
             disconnect();
+            connectExecutor.shutdownNow();
             transferExecutor.shutdownNow();
             Runnable handler = this.shutdownHandler;
             if (handler != null) {
@@ -545,9 +971,6 @@ public class PcEngineRuntime implements AutoCloseable {
         return new IpcPayloads.OkResult(true, "Shutdown initiated");
     }
 
-    /**
-     * Blocks until the active client session finishes (used by thin CLI shells).
-     */
     public void awaitSessionEnd() throws InterruptedException {
         CountDownLatch latch = this.sessionEndedLatch;
         if (latch != null) {
@@ -948,8 +1371,7 @@ public class PcEngineRuntime implements AutoCloseable {
             if (p.host != null && !p.host.trim().isEmpty()) {
                 return "direct";
             }
-            throw new EngineException(JsonRpcError.INVALID_PARAMS,
-                    "Specify mode='adb' or provide host for direct connection (mDNS auto-discovery lands in M4)");
+            return "auto";
         }
         throw new EngineException(JsonRpcError.INVALID_PARAMS, "Unsupported connect mode: " + p.mode);
     }

@@ -29,6 +29,10 @@ public final class PcEngineMain {
         public Integer adbStreams;
         public boolean disableAutoBind;
         public boolean noTokenAuth;
+        public boolean autoConnectTrusted;
+        public boolean disableMdns;
+        public Path trustedPeersPath;
+        public Path qrTempDir;
 
         public static EngineArgs parse(String[] args) {
             EngineArgs parsed = new EngineArgs();
@@ -58,6 +62,14 @@ public final class PcEngineMain {
                     parsed.disableAutoBind = true;
                 } else if ("--no-token-auth".equals(arg)) {
                     parsed.noTokenAuth = true;
+                } else if ("--auto-connect".equals(arg)) {
+                    parsed.autoConnectTrusted = true;
+                } else if ("--no-mdns".equals(arg)) {
+                    parsed.disableMdns = true;
+                } else if (arg.startsWith("--trusted-peers=")) {
+                    parsed.trustedPeersPath = Paths.get(arg.substring("--trusted-peers=".length()).trim());
+                } else if (arg.startsWith("--qr-dir=")) {
+                    parsed.qrTempDir = Paths.get(arg.substring("--qr-dir=".length()).trim());
                 }
             }
             return parsed;
@@ -70,6 +82,7 @@ public final class PcEngineMain {
     public static IpcDtos.EngineSnapshot createInitialSnapshot(String deviceId) {
         PcEngineRuntime.EngineConfig cfg = new PcEngineRuntime.EngineConfig();
         cfg.deviceId = deviceId != null ? deviceId : UUID.randomUUID().toString();
+        cfg.enableMdns = false;
         try (PcEngineRuntime runtime = new PcEngineRuntime(cfg)) {
             return runtime.getSnapshot();
         }
@@ -79,11 +92,15 @@ public final class PcEngineMain {
         EngineArgs parsed = EngineArgs.parse(args);
 
         PcEngineRuntime.EngineConfig cfg = new PcEngineRuntime.EngineConfig();
-        cfg.deviceId = parsed.deviceId != null ? parsed.deviceId : UUID.randomUUID().toString();
+        cfg.deviceId = parsed.deviceId; // null => load/persist stable PC ID in TrustedPeerStore
         cfg.defaultAutoSubnetBind = !parsed.disableAutoBind;
         cfg.adbConfig.explicitAdbPath = parsed.adbPath;
         cfg.adbConfig.adbLegacy = parsed.adbLegacy;
         cfg.adbConfig.overrideStreams = parsed.adbStreams;
+        cfg.autoConnectTrustedPeers = parsed.autoConnectTrusted;
+        cfg.enableMdns = !parsed.disableMdns;
+        cfg.trustedPeersPath = parsed.trustedPeersPath;
+        cfg.qrTempDir = parsed.qrTempDir;
 
         try (PcEngineRuntime runtime = new PcEngineRuntime(cfg)) {
             if ("stdio".equalsIgnoreCase(parsed.ipcMode)) {

@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import rikka.shizuku.Shizuku;
+import top.weixiansen574.hybridfilexfer.Config;
+import top.weixiansen574.hybridfilexfer.ConfigDB;
 import top.weixiansen574.hybridfilexfer.IOService;
 import top.weixiansen574.hybridfilexfer.R;
 import top.weixiansen574.hybridfilexfer.aidl.IHfxEngine;
@@ -71,6 +73,7 @@ public class HfxEngineService extends Service {
     private final Object ioBindLock = new Object();
 
     private HfxEngineController controller;
+    private NsdAdvertiser nsdAdvertiser;
     private ServiceConnection activeIoConnection;
     private boolean activeIoIsShizuku;
 
@@ -163,12 +166,43 @@ public class HfxEngineService extends Service {
     public void onCreate() {
         super.onCreate();
         ensureNotificationChannel();
+        Config appConfig = Config.getInstance(this);
+        final ConfigDB configDb = ConfigDB.getInstance(this);
+        String stableDeviceId = appConfig.getOrCreateDeviceId();
         String deviceName = Build.MODEL != null ? Build.MODEL : "Android";
+
+        TrustedPcStore trustedPcStore = new TrustedPcStore(new TrustedPcStore.PersistenceBackend() {
+            @Override
+            public List<TrustedPcStore.TrustedPcRecord> loadAll() {
+                return configDb.loadAllTrustedPcs();
+            }
+
+            @Override
+            public void upsert(TrustedPcStore.TrustedPcRecord record) {
+                configDb.upsertTrustedPc(record);
+            }
+
+            @Override
+            public boolean delete(String pcId) {
+                return configDb.deleteTrustedPc(pcId);
+            }
+        });
+
+        this.nsdAdvertiser = new NsdAdvertiser(this);
         this.controller = new HfxEngineController(
-                null,
+                stableDeviceId,
                 deviceName,
                 new UsbNicAdvisor(),
-                new AndroidServerBackend());
+                new AndroidServerBackend(),
+                HfxEngineController.DEFAULT_PROGRESS_THROTTLE_MS,
+                trustedPcStore,
+                this.nsdAdvertiser,
+                new PairClient());
+        this.controller.configurePairDefaults(
+                appConfig.getServerPort(),
+                appConfig.getMode(),
+                appConfig.getLocalBufferCount(),
+                appConfig.getRemoteBufferCount());
         this.controller.addEventListener(this::handleControllerEvent);
     }
 
@@ -198,6 +232,9 @@ public class HfxEngineService extends Service {
         stopLocalSocketBridge();
         if (controller != null) {
             controller.shutdown();
+        }
+        if (nsdAdvertiser != null) {
+            nsdAdvertiser.stopAdvertising();
         }
         unbindActiveIoService();
         stopForegroundNotification();
