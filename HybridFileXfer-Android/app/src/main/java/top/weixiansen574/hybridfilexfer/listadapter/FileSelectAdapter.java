@@ -51,6 +51,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
     private OnConfirmFileSelectionListener onConfirmFileSelectionListener;
     private LinkedList<DirPosition> positions = new LinkedList<>();
     private final int fileSystem;
+    private boolean isLoading = false;
 
     public FileSelectAdapter(Activity context, View loadingView, RecyclerView recyclerView, LinearLayoutManager
             linearLayoutManager, Toolbar fileSelectToolbar, View.OnTouchListener onTouchListener, HFXServer server) {
@@ -250,6 +251,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
     }
 
     protected void loading() {
+        isLoading = true;
         // 首先将视图的透明度设为 0（隐藏状态）
         loadingView.setAlpha(0f);
         // 然后将视图设置为可见
@@ -264,6 +266,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
     }
 
     protected void cancelLoading() {
+        isLoading = false;
         loadingView.setVisibility(View.GONE);
         recyclerView.setVisibility(View.VISIBLE);
         recyclerView.scheduleLayoutAnimation();
@@ -271,6 +274,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
     @SuppressLint("NotifyDataSetChanged")
     protected void changeFiles(List<RemoteFile> files) {
+        isLoading = false;
         loadingView.setVisibility(View.GONE);
         this.files = files;
         notifyDataSetChanged();
@@ -279,6 +283,9 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
     }
 
     public void cd(String dir) {
+        if (isLoading || positions.isEmpty()) {
+            return;
+        }
         loading();
         DirPosition currentPosition = positions.get(positions.size() - 1);
         //String dir = currentPosition.dir + name + "/";
@@ -302,12 +309,16 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
             @Override
             public void onError(Throwable th) {
+                isLoading = false;
                 handleListException(th);
             }
         });
     }
 
     public void jump(String dir) {
+        if (isLoading) {
+            return;
+        }
         loading();
         listFilesASync(dir, new ListFilesTask.CallBack() {
             @Override
@@ -319,29 +330,52 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
                 } else {
                     cancelLoading();
                     Toast.makeText(context, R.string.tiao_zhuan_shi_bai, Toast.LENGTH_SHORT).show();
+                    // If initial directory failed and panel has no loaded directory yet, fall back to root "/"
+                    if (positions.isEmpty() && !"/".equals(dir)) {
+                        jump("/");
+                    }
                 }
             }
 
             @Override
             public void onError(Throwable th) {
+                isLoading = false;
                 handleListException(th);
             }
         });
     }
 
     public void refresh() {
+        if (isLoading) {
+            return;
+        }
         loading();
-        listFilesASync(getCurrentDir(), files -> {
-            if (files != null) {
-                changeFiles(files);
-            } else {
-                cancelLoading();
-                Toast.makeText(context, R.string.shua_xin_shi_bai, Toast.LENGTH_SHORT).show();
+        listFilesASync(getCurrentDir(), new ListFilesTask.CallBack() {
+            @Override
+            public void onResult(List<RemoteFile> files) {
+                if (files != null) {
+                    if (positions.isEmpty()) {
+                        positions = createNewDirPositions(new Directory(getCurrentDir(), fileSystem));
+                    }
+                    changeFiles(files);
+                } else {
+                    cancelLoading();
+                    Toast.makeText(context, R.string.shua_xin_shi_bai, Toast.LENGTH_SHORT).show();
+                }
+            }
+
+            @Override
+            public void onError(Throwable th) {
+                isLoading = false;
+                handleListException(th);
             }
         });
     }
 
     public void back() {
+        if (isLoading) {
+            return;
+        }
         if (positions.size() < 2) {
             Toast.makeText(context, R.string.yi_jing_dao_gen_mu_lu_le, Toast.LENGTH_SHORT).show();
             return;
@@ -371,6 +405,7 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
             @Override
             public void onError(Throwable th) {
+                isLoading = false;
                 handleListException(th);
             }
         });
@@ -468,7 +503,11 @@ public abstract class FileSelectAdapter extends RecyclerView.Adapter<FileSelectA
 
     @Override
     public CharSequence getSectionText(int position) {
-        return String.valueOf(files.get(position).getName().charAt(0));
+        if (position < 0 || position >= files.size()) {
+            return "";
+        }
+        String name = files.get(position).getName();
+        return (name == null || name.isEmpty()) ? "" : String.valueOf(name.charAt(0));
     }
 
 

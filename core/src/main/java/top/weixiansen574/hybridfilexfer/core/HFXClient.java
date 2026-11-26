@@ -390,7 +390,11 @@ public abstract class HFXClient extends HFXService {
 
     private void handleListFiles() throws Exception {
         String path = ctChannel.readUTF();
-        if (!"/".equals(path)) {
+        if (path != null && !"/".equals(path)) {
+            if (Directory.getCurrentFileSystem() == Directory.FILE_SYSTEM_WINDOWS
+                    && path.length() == 2 && Character.isLetter(path.charAt(0)) && path.charAt(1) == ':') {
+                path = path + "\\";
+            }
             List<RemoteFile> files = listFiles(path);
             if (files != null) {
                 ctChannel.writeInt(files.size());

@@ -71,6 +71,12 @@ public class PcEngineBootstrapTest {
                     content.contains("Ljava/awt/"));
             assertFalse(":pc-engine must NOT reference android.*: " + cf.getName(),
                     content.contains("Landroid/"));
+            // Only PcEngineMain (stdio IPC transport bootstrap) may touch System.out;
+            // all engine business classes (adb, discovery, transport, jdkcore) must have zero PrintStream references.
+            if (!"PcEngineMain.class".equals(cf.getName())) {
+                assertFalse(":pc-engine business classes must NOT use System.out / PrintStream: " + cf.getName(),
+                        content.contains("Ljava/io/PrintStream;"));
+            }
         }
     }
 

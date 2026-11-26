@@ -35,6 +35,7 @@ import top.weixiansen574.nio.DataByteChannel;
  * registration by {@code (sessionToken, railId, streamIdx)}.</p>
  */
 public abstract class AbstractHFXServer extends HFXService {
+    protected final Object controlLock = new Object();
     protected ServerSocketChannel serverSocketChannel;
     protected int remoteFileSystem;
     protected String remoteHomeDir;
@@ -422,53 +423,63 @@ public abstract class AbstractHFXServer extends HFXService {
 
     public void sendFilesToRemote(List<RemoteFile> files, Directory localDir, Directory remoteDir,
                                   TransferFileCallback callback) throws IOException {
-        ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);
-        sendFiles(files, localDir, remoteDir, callback);
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);
+            sendFiles(files, localDir, remoteDir, callback);
+        }
     }
 
     public void sendFilesToShelf(List<RemoteFile> files, Directory localDir, Directory remoteDir,
                                  TransferFileCallback callback) throws IOException {
-        ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
-        ctChannel.writeInt(files.size());
-        for (RemoteFile file : files) {
-            ctChannel.writeUTF(file.getPath());
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
+            ctChannel.writeInt(files.size());
+            for (RemoteFile file : files) {
+                ctChannel.writeUTF(file.getPath());
+            }
+            ctChannel.writeUTF(localDir.path);
+            ctChannel.writeInt(localDir.fileSystem);
+            ctChannel.writeUTF(remoteDir.path);
+            receiveFiles(callback);
         }
-        ctChannel.writeUTF(localDir.path);
-        ctChannel.writeInt(localDir.fileSystem);
-        ctChannel.writeUTF(remoteDir.path);
-        receiveFiles(callback);
     }
 
     public List<RemoteFile> listClientFiles(String path) throws IOException {
-        ctChannel.writeShort(ControllerIdentifiers.LIST_FILES);
-        ctChannel.writeUTF(path);
-        int listSize = ctChannel.readInt();
-        if (listSize == -1) {
-            return null;
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.LIST_FILES);
+            ctChannel.writeUTF(path);
+            int listSize = ctChannel.readInt();
+            if (listSize == -1) {
+                return null;
+            }
+            ArrayList<RemoteFile> remoteFiles = new ArrayList<>(listSize);
+            for (int i = 0; i < listSize; i++) {
+                remoteFiles.add(new RemoteFile(
+                        ctChannel.readUTF(),
+                        ctChannel.readUTF(),
+                        ctChannel.readLong(),
+                        ctChannel.readLong(),
+                        ctChannel.readBoolean()));
+            }
+            return remoteFiles;
         }
-        ArrayList<RemoteFile> remoteFiles = new ArrayList<>(listSize);
-        for (int i = 0; i < listSize; i++) {
-            remoteFiles.add(new RemoteFile(
-                    ctChannel.readUTF(),
-                    ctChannel.readUTF(),
-                    ctChannel.readLong(),
-                    ctChannel.readLong(),
-                    ctChannel.readBoolean()));
-        }
-        return remoteFiles;
     }
 
     public boolean deleteRemoteFile(String file) throws IOException {
-        ctChannel.writeShort(ControllerIdentifiers.DELETE_FILE);
-        ctChannel.writeUTF(file);
-        return ctChannel.readBoolean();
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.DELETE_FILE);
+            ctChannel.writeUTF(file);
+            return ctChannel.readBoolean();
+        }
     }
 
     public boolean createRemoteDir(String parent, String child) throws IOException {
-        ctChannel.writeShort(ControllerIdentifiers.MKDIR);
-        ctChannel.writeUTF(parent);
-        ctChannel.writeUTF(child);
-        return ctChannel.readBoolean();
+        synchronized (controlLock) {
+            ctChannel.writeShort(ControllerIdentifiers.MKDIR);
+            ctChannel.writeUTF(parent);
+            ctChannel.writeUTF(child);
+            return ctChannel.readBoolean();
+        }
     }
 
     public List<String> getConnectionListINames() {

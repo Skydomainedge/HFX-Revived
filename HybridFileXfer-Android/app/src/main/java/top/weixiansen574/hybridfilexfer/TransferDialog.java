@@ -91,7 +91,8 @@ public class TransferDialog {
 
     public void complete(boolean isUpload, long traffic, long time) {
         setCloseBtnEnable(true);
-        dialog.setTitle((isUpload ? "▲" : "▼") + Utils.formatSpeed(traffic / time * 1000) +
+        long safeTime = Math.max(1L, time);
+        dialog.setTitle((isUpload ? "▲" : "▼") + Utils.formatSpeed(traffic * 1000L / safeTime) +
                 "·" + Utils.formatTime(time) + "·" + Utils.formatFileSize(traffic));
         for (Map.Entry<String, Holder> entry : holderMap.entrySet()) {
             Holder holder = entry.getValue();

@@ -15,31 +15,41 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.io.IOException;
-import java.net.Inet4Address;
 import java.net.InetAddress;
-import java.net.NetworkInterface;
 import java.net.SocketException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.List;
 
 import top.weixiansen574.hybridfilexfer.NetCardIcon;
-import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
 import top.weixiansen574.hybridfilexfer.R;
+import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcPayloads;
+import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
+import top.weixiansen574.hybridfilexfer.core.protocol.RailType;
+import top.weixiansen574.hybridfilexfer.engine.UsbNicAdvisor;
 
 public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHolder> {
 
     private final Context context;
+    private final UsbNicAdvisor advisor;
+    private UsbNicAdvisor.AdviceResult lastAdvice;
     private List<ItemServerNetInterface> netInterfaceList;
     private boolean enableModify = true;
 
     public NetCardsAdapter(Context context) throws IOException {
+        this(context, new UsbNicAdvisor());
+    }
+
+    public NetCardsAdapter(Context context, UsbNicAdvisor advisor) throws IOException {
         this.context = context;
-        netInterfaceList = getNetInterfaces();
+        this.advisor = advisor != null ? advisor : new UsbNicAdvisor();
+        this.netInterfaceList = loadAdvisedInterfaces();
     }
 
     @NonNull
@@ -48,49 +58,86 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
         return new ViewHolder(LayoutInflater.from(context).inflate(R.layout.item_net_card_info, parent, false));
     }
 
-    @SuppressLint({"UseCompatLoadingForDrawables", "SetTextI18n"})
+    @SuppressLint("SetTextI18n")
     @Override
     public void onBindViewHolder(@NonNull ViewHolder holder, int position) {
-        ItemServerNetInterface itemServerNetInterface = netInterfaceList.get(position);
-        holder.txvNameAndState.setText(itemServerNetInterface.name + " | " + itemServerNetInterface.state);
-        holder.txvIP.setText(itemServerNetInterface.address.getHostAddress());
-        String iName = itemServerNetInterface.name;
-        boolean enableBindIpInput = !iName.equals("USB_ADB");
-        holder.imgInterfaceType.setImageDrawable(context.getDrawable(NetCardIcon.matchIdForIName(iName)));
+        final ItemServerNetInterface item = netInterfaceList.get(position);
+        holder.txvNameAndState.setText(formatTitle(item));
+        holder.txvIP.setText(formatSubtitle(item));
+
+        boolean enableBindIpInput = item.railType != RailType.ADB;
+        holder.imgInterfaceType.setImageDrawable(
+                ContextCompat.getDrawable(context, NetCardIcon.matchIdForRailType(item.railType, item.name)));
 
         holder.editClientBindIP.setEnabled(enableModify && enableBindIpInput);
         holder.cbEnable.setEnabled(enableModify);
-        holder.cbEnable.setChecked(itemServerNetInterface.enable);
 
+        // Detach previous listeners before updating state to prevent recycled/rebound ViewHolder contamination
+        holder.cbEnable.setOnCheckedChangeListener(null);
+        if (holder.bindIpWatcher != null) {
+            holder.editClientBindIP.removeTextChangedListener(holder.bindIpWatcher);
+            holder.bindIpWatcher = null;
+        }
 
-        holder.cbEnable.setOnCheckedChangeListener((buttonView, isChecked) -> {
-            itemServerNetInterface.enable = isChecked;
-        });
+        holder.cbEnable.setChecked(item.enable);
+        holder.editClientBindIP.setText(item.clientBindAddress);
 
-        holder.editClientBindIP.setText(itemServerNetInterface.clientBindAddress);
+        holder.cbEnable.setOnCheckedChangeListener((buttonView, isChecked) -> item.enable = isChecked);
 
-        holder.editClientBindIP.addTextChangedListener(new TextWatcher() {
+        TextWatcher watcher = new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {
-
             }
 
             @Override
             public void onTextChanged(CharSequence s, int start, int before, int count) {
-                itemServerNetInterface.clientBindAddress = s.toString();
+                item.clientBindAddress = s != null ? s.toString() : "";
             }
 
             @Override
             public void afterTextChanged(Editable s) {
-
             }
-        });
+        };
+        holder.bindIpWatcher = watcher;
+        holder.editClientBindIP.addTextChangedListener(watcher);
+    }
 
+    private String formatTitle(ItemServerNetInterface item) {
+        StringBuilder sb = new StringBuilder(item.name);
+        if (!TextUtils.isEmpty(item.tag)) {
+            sb.append(" [").append(item.tag).append("]");
+        }
+        sb.append(" | ").append(item.state);
+        return sb.toString();
+    }
+
+    private String formatSubtitle(ItemServerNetInterface item) {
+        String ip = item.address.getHostAddress();
+        if (!TextUtils.isEmpty(item.note)) {
+            return ip + " · " + item.note;
+        }
+        return ip;
     }
 
     @Override
     public int getItemCount() {
         return netInterfaceList.size();
+    }
+
+    public UsbNicAdvisor.AdviceResult getLastAdvice() {
+        return lastAdvice;
+    }
+
+    public String getUdcSpeed() {
+        return lastAdvice != null ? lastAdvice.udcSpeed : UsbNicAdvisor.SPEED_UNKNOWN;
+    }
+
+    public boolean isVpnActive() {
+        return lastAdvice != null && lastAdvice.vpnActive;
+    }
+
+    public IpcPayloads.RailConflictResolvedPayload getConflictResolved() {
+        return lastAdvice != null ? lastAdvice.conflictResolved : null;
     }
 
     public void changeItemState(String name, String state) {
@@ -102,17 +149,6 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
             }
         }
     }
-
-    @Override
-    public int getItemViewType(int position) {
-        return position;
-    }
-
-    @Override
-    public long getItemId(int position) {
-        return position;
-    }
-
 
     @SuppressLint("NotifyDataSetChanged")
     public void setEnableModify(boolean enableModify) {
@@ -132,8 +168,8 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
                 try {
                     serverNetInterfaceList.add(netInterface.toServerNetInterface());
                 } catch (Exception e) {
-                    e.printStackTrace();
-                    Toast.makeText(context, context.getString(R.string.invalid_ip) + netInterface.clientBindAddress, Toast.LENGTH_SHORT).show();
+                    Toast.makeText(context, context.getString(R.string.invalid_ip) + netInterface.clientBindAddress,
+                            Toast.LENGTH_SHORT).show();
                     return null;
                 }
             }
@@ -143,10 +179,54 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
 
     @SuppressLint("NotifyDataSetChanged")
     public void reload() throws SocketException, UnknownHostException {
-        netInterfaceList = getNetInterfaces();
+        netInterfaceList = loadAdvisedInterfaces();
         notifyDataSetChanged();
     }
 
+    private ArrayList<ItemServerNetInterface> loadAdvisedInterfaces() throws SocketException, UnknownHostException {
+        UsbNicAdvisor.AdviceResult advice = advisor.advise();
+        this.lastAdvice = advice;
+        String defaultState = context.getString(R.string.not_run);
+        String udcLabel = UsbNicAdvisor.formatUdcSpeedShortLabel(advice.udcSpeed);
+
+        ArrayList<ItemServerNetInterface> items = new ArrayList<>(advice.nics.size());
+        for (IpcDtos.NicInfo nic : advice.nics) {
+            RailType railType = parseRailType(nic.railType, nic.name);
+            InetAddress addr = InetAddress.getByName(nic.ip);
+            ItemServerNetInterface item = new ItemServerNetInterface(nic.name, addr, railType, defaultState);
+            item.enable = nic.selected;
+            if (nic.clientBindIp != null) {
+                item.clientBindAddress = nic.clientBindIp;
+            }
+            if (nic.usbNic) {
+                item.tag = !udcLabel.isEmpty() ? udcLabel : "USB NIC";
+            } else if (nic.vpn) {
+                item.tag = "VPN";
+            } else if (railType == RailType.ADB && !udcLabel.isEmpty()) {
+                item.tag = udcLabel;
+            }
+            if (UsbNicAdvisor.REASON_USB_NIC_ACTIVE_AUTO_DISABLED.equals(nic.reason)
+                    && advice.conflictResolved != null
+                    && !advice.conflictResolved.activeUsbNics.isEmpty()) {
+                item.note = "auto-off (" + TextUtils.join(",", advice.conflictResolved.activeUsbNics) + ")";
+            }
+            items.add(item);
+        }
+        return items;
+    }
+
+    private static RailType parseRailType(String railTypeName, String ifName) {
+        if (railTypeName != null && !railTypeName.isEmpty()) {
+            try {
+                return RailType.valueOf(railTypeName);
+            } catch (IllegalArgumentException ignored) {
+            }
+        }
+        if (ProtocolConstants.USB_ADB_RAIL_NAME.equalsIgnoreCase(ifName)) {
+            return RailType.ADB;
+        }
+        return RailType.inferFromInterfaceName(ifName);
+    }
 
     public static class ViewHolder extends RecyclerView.ViewHolder {
         CheckBox cbEnable;
@@ -154,6 +234,7 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
         TextView txvIP;
         EditText editClientBindIP;
         ImageView imgInterfaceType;
+        TextWatcher bindIpWatcher;
 
         public ViewHolder(@NonNull View itemView) {
             super(itemView);
@@ -166,48 +247,27 @@ public class NetCardsAdapter extends RecyclerView.Adapter<NetCardsAdapter.ViewHo
     }
 
     public static class ItemServerNetInterface {
-
         boolean enable = true;
         String name;
         InetAddress address;
+        RailType railType;
         String clientBindAddress = "";
         String state;
+        String tag = "";
+        String note = "";
 
-        public ItemServerNetInterface(String name, InetAddress address, String state) {
+        public ItemServerNetInterface(String name, InetAddress address, RailType railType, String state) {
             this.name = name;
-            this.state = state;
             this.address = address;
+            this.railType = railType != null ? railType : RailType.inferFromInterfaceName(name);
+            this.state = state;
         }
 
         public ServerNetInterface toServerNetInterface() throws UnknownHostException {
-            return new ServerNetInterface(name, address, TextUtils.isEmpty(clientBindAddress) ? null :
-                    InetAddress.getByName(clientBindAddress));
+            InetAddress bindAddr = TextUtils.isEmpty(clientBindAddress)
+                    ? null
+                    : InetAddress.getByName(clientBindAddress.trim());
+            return new ServerNetInterface(name, address, bindAddr, railType, 1);
         }
     }
-
-    private ArrayList<ItemServerNetInterface> getNetInterfaces() throws SocketException, UnknownHostException {
-        ArrayList<ItemServerNetInterface> netInterfaceList = new ArrayList<>();
-        netInterfaceList.add(new ItemServerNetInterface("USB_ADB", InetAddress.getByName("127.0.0.1"), context.getString(R.string.not_run)));
-        Enumeration<NetworkInterface> networkInterfaces = NetworkInterface.getNetworkInterfaces();
-        while (networkInterfaces.hasMoreElements()) {
-            NetworkInterface networkInterface = networkInterfaces.nextElement();
-            //System.out.println(networkInterface.getDisplayName());
-            Enumeration<InetAddress> inetAddresses = networkInterface.getInetAddresses();
-            while (inetAddresses.hasMoreElements()) {
-                InetAddress address = inetAddresses.nextElement();
-                if (!address.isLoopbackAddress() && address instanceof Inet4Address
-                        && !networkInterface.getDisplayName().startsWith("rmnet_data"/*数据流量除外*/)) {
-                    ItemServerNetInterface item = new ItemServerNetInterface(networkInterface.getDisplayName(), address, context.getString(R.string.not_run));
-                    //VPN开的虚拟网卡，默认不勾选
-                    if (item.name.startsWith("tun")) {
-                        item.enable = false;
-                    }
-                    netInterfaceList.add(item);
-                    System.out.println(networkInterface.getDisplayName() + "  " + address);
-                }
-            }
-        }
-        return netInterfaceList;
-    }
-
 }

@@ -50,7 +50,7 @@ public class Directory {
             if ("/".equals(path)) return null;
             String norm = path.substring(0, path.length() - 1);
             int idx = norm.lastIndexOf("\\");
-            if (idx <= 2) return new Directory("/", fileSystem);
+            if (idx < 2) return new Directory("/", fileSystem);
             return new Directory(norm.substring(0, idx + 1), fileSystem);
         }
     }

@@ -5,21 +5,22 @@ import top.weixiansen574.hybridfilexfer.core.bean.TrafficInfo;
 import top.weixiansen574.hybridfilexfer.core.callback.ClientCallBack;
 import top.weixiansen574.hybridfilexfer.core.callback.ConnectServerCallback;
 import top.weixiansen574.hybridfilexfer.core.callback.TransferFileCallback;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcEvents;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcPayloads;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
 import top.weixiansen574.hybridfilexfer.jdkcore.JdkHFXClient;
+import top.weixiansen574.hybridfilexfer.pc.engine.adb.AdbManager;
 
-import java.io.BufferedReader;
 import java.io.File;
-import java.io.IOException;
-import java.io.InputStreamReader;
 import java.net.InetAddress;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Thin backwards-compatible CLI shell preserving legacy {@code -c adb} / {@code -c <ip>} invocation.
- * In M3/M4 this shell delegates exclusively through the pc-engine IPC contract.
+ * M2 upgrades {@code -c adb} to use {@link AdbManager} (modern ADB version selection, process-level
+ * {@code ADB_LIBUSB}/{@code ADB_BURST_MODE} injection, automatic 4-stream fallback, and clean
+ * {@code adb forward --remove} on exit) while keeping all legacy flags compatible.
  */
 public class Main {
     private static final ConnectServerCallback connectServerCallback = new ConnectServerCallback() {
@@ -151,118 +152,122 @@ public class Main {
     };
 
     public static void main(String[] args) throws Exception {
-        Map<String, String> paramMap = new HashMap<>();
-        parseArguments(paramMap, args);
+        CliOptions opts;
+        try {
+            opts = CliOptions.parse(args);
+        } catch (CliOptions.ParseException e) {
+            Strings.printf(e.messageKey, e.detail);
+            Strings.printf("see_help");
+            System.exit(1);
+            return;
+        }
 
-        if (paramMap.containsKey("-v")) {
+        if (opts.showVersion) {
             System.out.println("HybridFileXfer v" + ProtocolConstants.ENGINE_VERSION
                     + " (protocol " + ProtocolConstants.VERSION_CODE + ")");
             return;
         }
 
-        if (paramMap.containsKey("-h") || paramMap.isEmpty()) {
+        if (opts.showHelp || opts.emptyArgs) {
             Strings.printf("help_pages");
             return;
         }
 
-        final String connect = paramMap.get("-c");
-        String homeDir = paramMap.get("-d");
-        final String device = paramMap.get("-s");
-
-        if (homeDir == null) {
-            homeDir = "/";
-        }
-
-        if (connect == null || connect.isEmpty()) {
+        if (opts.connect == null || opts.connect.isEmpty()) {
             System.err.println(Strings.get("control_chanel_null"));
             Strings.printf("see_help");
             return;
         }
 
+        AdbManager adbManager = null;
         final String serverAddress;
-        if ("adb".equals(connect)) {
-            if (executeAdbForwardCommand(ProtocolConstants.DEFAULT_CONTROL_PORT, device)) {
+        int requestedAdbStreams = opts.adbStreams != null ? opts.adbStreams : 0;
+
+        try {
+            if ("adb".equalsIgnoreCase(opts.connect)) {
+                AdbManager.AdbConfig adbConfig = buildAdbConfig(opts);
+                adbManager = new AdbManager(adbConfig, (eventName, payload) -> {
+                    if (IpcEvents.ADB_VERSION_WARNING.equals(eventName)
+                            && payload instanceof IpcPayloads.DiagnosticWarningPayload) {
+                        IpcPayloads.DiagnosticWarningPayload warn = (IpcPayloads.DiagnosticWarningPayload) payload;
+                        System.err.println("[WARN][" + warn.code + "] " + warn.message);
+                    }
+                });
+                adbManager.registerShutdownHook();
+
+                AdbManager.ForwardResult forward = adbManager.forwardPort(
+                        ProtocolConstants.DEFAULT_CONTROL_PORT,
+                        ProtocolConstants.DEFAULT_CONTROL_PORT,
+                        opts.device);
+                if (!forward.success) {
+                    if (!forward.stderr.isEmpty()) {
+                        System.err.println(forward.stderr.trim());
+                    }
+                    return;
+                }
+
+                IpcDtos.AdbCapabilityInfo cap = forward.capability;
+                if (cap != null) {
+                    requestedAdbStreams = cap.recommendedStreams;
+                    System.out.printf("ADB: %s (v%s, libusb=%s, delayed_ack=%s, streams=%d)%n",
+                            cap.adbPath, cap.version, cap.hasLibusb, cap.hasDelayedAck, requestedAdbStreams);
+                }
                 System.out.println(Strings.get("adb_forward_succeed"));
                 serverAddress = "127.0.0.1";
             } else {
-                return;
+                serverAddress = opts.connect;
             }
-        } else {
-            serverAddress = connect;
-        }
 
-        JdkHFXClient hfxClient = new JdkHFXClient(serverAddress, ProtocolConstants.DEFAULT_CONTROL_PORT, homeDir);
-        if (hfxClient.connect(connectServerCallback)) {
-            hfxClient.start(clientCallBack);
-        }
-    }
-
-    private static void parseArguments(Map<String, String> paramMap, String[] args) {
-        for (int i = 0; i < args.length; i++) {
-            String arg = args[i];
-            if (arg.startsWith("-")) {
-                String value = null;
-                String key = arg;
-                if (arg.contains("=")) {
-                    final int eqPos = arg.indexOf('=');
-                    if (eqPos < arg.length() - 1) {
-                        value = arg.substring(eqPos + 1);
-                    }
-                    key = arg.substring(0, eqPos);
-                } else if (i + 1 < args.length && !args[i + 1].startsWith("-")) {
-                    value = args[i + 1];
-                    i++;
-                }
-
-                switch (key) {
-                    case "--connect": key = "-c"; break;
-                    case "--switch-device": key = "-s"; break;
-                    case "--dir": key = "-d"; break;
-                    case "--help": key = "-h"; break;
-                    case "--version": key = "-v"; break;
-                    case "-c":
-                    case "-s":
-                    case "-d":
-                    case "-h":
-                    case "-v":
-                        break;
-                    default:
-                        Strings.printf("unknown_option", key);
-                        Strings.printf("see_help");
-                        System.exit(1);
-                }
-                paramMap.put(key, value);
+            String effectiveHomeDir = resolveEffectiveHomeDir(opts.homeDir);
+            JdkHFXClient hfxClient = new JdkHFXClient(
+                    serverAddress, ProtocolConstants.DEFAULT_CONTROL_PORT, effectiveHomeDir);
+            if (requestedAdbStreams > 0) {
+                hfxClient.setRequestedAdbStreams(requestedAdbStreams);
+            }
+            if (opts.disableAutoBind) {
+                hfxClient.setAutoSubnetBindEnabled(false);
+            }
+            if (hfxClient.connect(connectServerCallback)) {
+                hfxClient.start(clientCallBack);
+            }
+        } finally {
+            if (adbManager != null) {
+                adbManager.close();
             }
         }
     }
 
-    public static boolean executeAdbForwardCommand(int port, String device) {
-        try {
-            String jarDirectory = System.getProperty("user.dir");
-            ProcessBuilder versionPb = new ProcessBuilder("adb", "version");
-            Process process = versionPb.start();
-            int exitCode = process.waitFor();
-            String adbPath = (exitCode == 0) ? "adb" : "./adb";
-
-            ProcessBuilder forwardPb = (device != null && !device.isEmpty())
-                    ? new ProcessBuilder(adbPath, "-s", device, "forward", "tcp:" + port, "tcp:" + port)
-                    : new ProcessBuilder(adbPath, "forward", "tcp:" + port, "tcp:" + port);
-            forwardPb.directory(new File(jarDirectory));
-            Process forwardProcess = forwardPb.start();
-            try (BufferedReader errorReader = new BufferedReader(new InputStreamReader(forwardProcess.getErrorStream()));
-                 BufferedReader reader = new BufferedReader(new InputStreamReader(forwardProcess.getInputStream()))) {
-                String line;
-                while ((line = errorReader.readLine()) != null) {
-                    System.err.println(line);
-                }
-                while ((line = reader.readLine()) != null) {
-                    System.out.println("adb:" + line);
-                }
-            }
-            return forwardProcess.waitFor() == 0;
-        } catch (IOException | InterruptedException e) {
-            e.printStackTrace();
-            return false;
+    static String resolveEffectiveHomeDir(String requestedHomeDir) {
+        if (requestedHomeDir == null || requestedHomeDir.trim().isEmpty() || "/".equals(requestedHomeDir.trim())) {
+            return "/";
         }
+        String trimmed = requestedHomeDir.trim();
+        if (File.separatorChar == '\\' && trimmed.length() == 2
+                && Character.isLetter(trimmed.charAt(0)) && trimmed.charAt(1) == ':') {
+            trimmed = trimmed + "\\";
+        }
+        File dir = new File(trimmed);
+        if (!dir.exists()) {
+            if (dir.mkdirs()) {
+                System.out.println("Created target home directory: " + dir.getAbsolutePath());
+            } else {
+                System.err.println("[WARN] Target directory does not exist and could not be created: "
+                        + trimmed + "; falling back to /");
+                return "/";
+            }
+        }
+        if (!dir.isDirectory() || dir.listFiles() == null) {
+            System.err.println("[WARN] Target directory is not accessible: " + trimmed + "; falling back to /");
+            return "/";
+        }
+        return dir.getAbsolutePath();
+    }
+
+    static AdbManager.AdbConfig buildAdbConfig(CliOptions opts) {
+        AdbManager.AdbConfig config = new AdbManager.AdbConfig();
+        config.explicitAdbPath = opts.adbPath;
+        config.adbLegacy = opts.adbLegacy;
+        config.overrideStreams = opts.adbStreams;
+        return config;
     }
 }

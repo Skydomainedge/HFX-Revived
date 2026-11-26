@@ -85,6 +85,7 @@ public class TransferActivity extends AppCompatActivity {
         leftRVAdapter = new LocalFileSelectAdapter(context, findViewById(R.id.loading_left),
                 leftList, layoutManager, leftSelectToolbar, onTouchListener, server);
         leftList.setAdapter(leftRVAdapter);
+        findViewById(R.id.left).setOnTouchListener(onTouchListener);
         Animation animation = AnimationUtils.loadAnimation(context, R.anim.list_anim);
         LayoutAnimationController layoutAnimationController = new LayoutAnimationController(animation);
         layoutAnimationController.setOrder(LayoutAnimationController.ORDER_NORMAL);
@@ -100,6 +101,7 @@ public class TransferActivity extends AppCompatActivity {
         rightRVAdapter = new RemoteFileSelectAdapter(context, findViewById(R.id.loading_right),
                 rightList, layoutManager, rightSelectToolbar, onTouchListener, server);
         rightList.setAdapter(rightRVAdapter);
+        findViewById(R.id.right).setOnTouchListener(onTouchListener);
         animation = AnimationUtils.loadAnimation(context, R.anim.list_anim);
         layoutAnimationController = new LayoutAnimationController(animation);
         layoutAnimationController.setOrder(LayoutAnimationController.ORDER_NORMAL);
@@ -367,7 +369,7 @@ public class TransferActivity extends AppCompatActivity {
         @Override
         public void onChannelComplete(String iName, long traffic, long time) {
             transferDialog.showEvent(iName, String.format("传输完毕！平均速度：%s",
-                    time == 0 ? "∞" : Utils.formatSpeed(traffic / time * 1000)));
+                    time <= 0 ? "∞" : Utils.formatSpeed(traffic * 1000L / time)));
         }
 
         @Override

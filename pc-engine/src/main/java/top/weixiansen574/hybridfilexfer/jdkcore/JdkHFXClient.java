@@ -1,6 +1,7 @@
 package top.weixiansen574.hybridfilexfer.jdkcore;
 
 import java.io.File;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.concurrent.LinkedBlockingDeque;
@@ -11,11 +12,51 @@ import top.weixiansen574.hybridfilexfer.core.Utils;
 import top.weixiansen574.hybridfilexfer.core.WriteFileCall;
 import top.weixiansen574.hybridfilexfer.core.bean.Directory;
 import top.weixiansen574.hybridfilexfer.core.bean.RemoteFile;
+import top.weixiansen574.hybridfilexfer.core.bean.ServerNetInterface;
+import top.weixiansen574.hybridfilexfer.core.protocol.RailType;
+import top.weixiansen574.hybridfilexfer.pc.engine.transport.SubnetBindResolver;
 
 public class JdkHFXClient extends HFXClient {
+    private SubnetBindResolver subnetBindResolver;
+    private boolean autoSubnetBindEnabled = true;
 
     public JdkHFXClient(String serverControllerAddress, int serverPort, String homeDir) {
+        this(serverControllerAddress, serverPort, homeDir, new SubnetBindResolver());
+    }
+
+    public JdkHFXClient(String serverControllerAddress, int serverPort, String homeDir,
+                        SubnetBindResolver subnetBindResolver) {
         super(serverControllerAddress, serverPort, homeDir);
+        this.subnetBindResolver = subnetBindResolver;
+    }
+
+    public void setSubnetBindResolver(SubnetBindResolver subnetBindResolver) {
+        this.subnetBindResolver = subnetBindResolver;
+    }
+
+    public void setAutoSubnetBindEnabled(boolean enabled) {
+        this.autoSubnetBindEnabled = enabled;
+    }
+
+    public boolean isAutoSubnetBindEnabled() {
+        return autoSubnetBindEnabled;
+    }
+
+    @Override
+    protected InetAddress resolveLocalBindAddress(ServerNetInterface rail) {
+        if (rail == null) {
+            return null;
+        }
+        if (rail.clientBindAddress != null) {
+            return rail.clientBindAddress;
+        }
+        if (!autoSubnetBindEnabled || subnetBindResolver == null) {
+            return null;
+        }
+        if (rail.railType == RailType.ADB || rail.address == null || rail.address.isLoopbackAddress()) {
+            return null;
+        }
+        return subnetBindResolver.resolveLocalBindAddress(rail.address);
     }
 
     @Override
