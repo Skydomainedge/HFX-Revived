@@ -91,6 +91,18 @@ public final class PcEngineMain {
     public static void main(String[] args) throws Exception {
         EngineArgs parsed = EngineArgs.parse(args);
 
+        boolean isStdio = "stdio".equalsIgnoreCase(parsed.ipcMode);
+        boolean isLocalSocket = parsed.ipcMode != null
+                && (parsed.ipcMode.startsWith("tcp://") || parsed.ipcMode.startsWith("unix://"));
+        if (!isStdio && !isLocalSocket) {
+            System.err.println("Unsupported --ipc mode: " + parsed.ipcMode
+                    + " (expected stdio | tcp://127.0.0.1:0 | unix://<path>, protocol="
+                    + ProtocolConstants.VERSION_CODE + ")");
+            System.err.flush();
+            System.exit(2);
+            return;
+        }
+
         PcEngineRuntime.EngineConfig cfg = new PcEngineRuntime.EngineConfig();
         cfg.deviceId = parsed.deviceId; // null => load/persist stable PC ID in TrustedPeerStore
         cfg.defaultAutoSubnetBind = !parsed.disableAutoBind;
@@ -102,14 +114,15 @@ public final class PcEngineMain {
         cfg.trustedPeersPath = parsed.trustedPeersPath;
         cfg.qrTempDir = parsed.qrTempDir;
 
+        int exitCode = 0;
         try (PcEngineRuntime runtime = new PcEngineRuntime(cfg)) {
-            if ("stdio".equalsIgnoreCase(parsed.ipcMode)) {
+            if (isStdio) {
                 JsonRpcDispatcher dispatcher = new JsonRpcDispatcher(runtime, null);
                 try (StdioIpcTransport transport = new StdioIpcTransport(dispatcher, System.in, System.out)) {
                     runtime.setShutdownHandler(transport::close);
                     transport.runBlocking();
                 }
-            } else if (parsed.ipcMode.startsWith("tcp://") || parsed.ipcMode.startsWith("unix://")) {
+            } else {
                 String token = parsed.noTokenAuth ? null : LocalSocketIpcTransport.generateRandomToken();
                 JsonRpcDispatcher dispatcher = new JsonRpcDispatcher(runtime, token);
                 try (LocalSocketIpcTransport transport = new LocalSocketIpcTransport(
@@ -117,12 +130,17 @@ public final class PcEngineMain {
                     transport.start();
                     transport.awaitTermination();
                 }
-            } else {
-                System.err.println("Unsupported --ipc mode: " + parsed.ipcMode
-                        + " (expected stdio | tcp://127.0.0.1:0 | unix://<path>, protocol="
-                        + ProtocolConstants.VERSION_CODE + ")");
-                System.exit(2);
             }
+        } catch (Throwable t) {
+            t.printStackTrace(System.err);
+            exitCode = 1;
         }
+
+        // P0-BUG-01: org.jmdns:jmdns:3.5.9 leaks non-daemon threads (State.Timer / pool-*-thread-1)
+        // after jmdns.close(), hanging DestroyJavaVM indefinitely. Explicit System.exit after
+        // graceful PcEngineRuntime.close() guarantees deterministic JVM termination and zero JAR locks.
+        System.out.flush();
+        System.err.flush();
+        System.exit(exitCode);
     }
 }

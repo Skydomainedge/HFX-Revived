@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Toolkit.Uwp.Notifications;
@@ -17,8 +18,22 @@ namespace HybridFileXferLauncher;
 /// </summary>
 public static class Program
 {
+    private delegate bool ConsoleCtrlHandlerDelegate(uint ctrlType);
+
+    private const uint CTRL_C_EVENT = 0;
+    private const uint CTRL_BREAK_EVENT = 1;
+    private const uint CTRL_CLOSE_EVENT = 2;
+    private const uint CTRL_LOGOFF_EVENT = 5;
+    private const uint CTRL_SHUTDOWN_EVENT = 6;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetConsoleCtrlHandler(ConsoleCtrlHandlerDelegate handler, bool add);
+
     private static volatile string? _activeQrPngPath;
     private static EngineStdioBridge? _bridge;
+    // Keep a static GC root for the native SetConsoleCtrlHandler callback delegate.
+    private static ConsoleCtrlHandlerDelegate? _consoleCtrlHandler;
 
     public static async Task<int> Main(string[] args)
     {
@@ -27,6 +42,11 @@ public static class Program
         if (args.Any(a => a.Equals("--verify-toast-xml", StringComparison.OrdinalIgnoreCase)))
         {
             return RunToastXmlSelfTest();
+        }
+
+        if (args.Any(a => a.Equals("--verify-job-object", StringComparison.OrdinalIgnoreCase)))
+        {
+            return RunJobObjectSelfTest();
         }
 
         if (args.Any(a => a is "-h" or "--help"))
@@ -67,6 +87,32 @@ public static class Program
             e.Cancel = true;
             exitCts.Cancel();
         };
+
+        _consoleCtrlHandler = ctrlType =>
+        {
+            if (ctrlType is CTRL_CLOSE_EVENT or CTRL_LOGOFF_EVENT or CTRL_SHUTDOWN_EVENT)
+            {
+                try { exitCts.Cancel(); } catch { }
+                if (!noToast)
+                {
+                    DismissPairQrToast();
+                }
+                _bridge?.ShutdownSyncAndKill(TimeSpan.FromMilliseconds(2200));
+                return false;
+            }
+            return false;
+        };
+        SetConsoleCtrlHandler(_consoleCtrlHandler, true);
+
+        EventHandler processExitHandler = (_, _) =>
+        {
+            if (!noToast)
+            {
+                DismissPairQrToast();
+            }
+            _bridge?.ShutdownSyncAndKill(TimeSpan.FromMilliseconds(1500));
+        };
+        AppDomain.CurrentDomain.ProcessExit += processExitHandler;
 
         bridge.StderrReceived += line => Console.Error.WriteLine($"[engine] {line}");
         bridge.EventReceived += (eventName, payload) => HandleEngineEvent(eventName, payload, noToast);
@@ -129,6 +175,12 @@ public static class Program
         }
         finally
         {
+            AppDomain.CurrentDomain.ProcessExit -= processExitHandler;
+            if (_consoleCtrlHandler != null)
+            {
+                SetConsoleCtrlHandler(_consoleCtrlHandler, false);
+                _consoleCtrlHandler = null;
+            }
             if (!noToast)
             {
                 DismissPairQrToast();
@@ -346,6 +398,13 @@ public static class Program
 
         Console.WriteLine("[PASS] Win11 Toast XML invariants verified (zero placement=\"hero\", inline hint-crop=\"none\", actions valid).");
         Console.WriteLine(xml);
+        return 0;
+    }
+
+    private static int RunJobObjectSelfTest()
+    {
+        ChildProcessJobObject.VerifySelfTest();
+        Console.WriteLine("[PASS] Win32 Job Object (JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE) verified.");
         return 0;
     }
 

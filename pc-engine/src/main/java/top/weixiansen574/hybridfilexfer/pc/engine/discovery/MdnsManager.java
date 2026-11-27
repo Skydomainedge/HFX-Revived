@@ -13,6 +13,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.jmdns.JmDNS;
@@ -87,10 +89,13 @@ public class MdnsManager implements AutoCloseable {
         void onServiceRemoved(String nicIp, String serviceKey);
     }
 
+    public static final long DEFAULT_CLOSE_TIMEOUT_MS = 1500L;
+
     private final NicSelector nicSelector;
     private final TrustedPeerStore trustedPeerStore;
     private final String hostName;
     private final MdnsBindingFactory bindingFactory;
+    private final long closeTimeoutMs;
 
     private final CopyOnWriteArrayList<PeerDiscoveryListener> listeners = new CopyOnWriteArrayList<>();
     private final Map<String, MdnsNicBinding> activeBindings = new LinkedHashMap<>();
@@ -104,17 +109,26 @@ public class MdnsManager implements AutoCloseable {
     private volatile List<IpcDtos.NicInfo> boundNics = Collections.emptyList();
 
     public MdnsManager(NicSelector nicSelector, TrustedPeerStore trustedPeerStore, String hostName) {
-        this(nicSelector, trustedPeerStore, hostName, MdnsManager::createRealJmDnsBinding);
+        this(nicSelector, trustedPeerStore, hostName, MdnsManager::createRealJmDnsBinding, DEFAULT_CLOSE_TIMEOUT_MS);
     }
 
     public MdnsManager(NicSelector nicSelector,
                        TrustedPeerStore trustedPeerStore,
                        String hostName,
                        MdnsBindingFactory bindingFactory) {
+        this(nicSelector, trustedPeerStore, hostName, bindingFactory, DEFAULT_CLOSE_TIMEOUT_MS);
+    }
+
+    MdnsManager(NicSelector nicSelector,
+                TrustedPeerStore trustedPeerStore,
+                String hostName,
+                MdnsBindingFactory bindingFactory,
+                long closeTimeoutMs) {
         this.nicSelector = nicSelector != null ? nicSelector : new NicSelector();
         this.trustedPeerStore = trustedPeerStore;
         this.hostName = (hostName != null && !hostName.trim().isEmpty()) ? hostName.trim() : "hfx-pc";
         this.bindingFactory = bindingFactory != null ? bindingFactory : MdnsManager::createRealJmDnsBinding;
+        this.closeTimeoutMs = closeTimeoutMs > 0L ? closeTimeoutMs : DEFAULT_CLOSE_TIMEOUT_MS;
     }
 
     public void addListener(PeerDiscoveryListener listener) {
@@ -166,12 +180,7 @@ public class MdnsManager implements AutoCloseable {
                 activeBindings.remove(ip);
             }
         }
-        for (MdnsNicBinding binding : toClose) {
-            try {
-                binding.close();
-            } catch (Exception ignored) {
-            }
-        }
+        closeBindingsWithTimeout(toClose, closeTimeoutMs);
 
         if (!started.get()) {
             return;
@@ -202,12 +211,16 @@ public class MdnsManager implements AutoCloseable {
             try {
                 MdnsNicBinding binding = bindingFactory.bind(nic, hostName, sink);
                 if (binding != null) {
+                    boolean discardBinding = false;
                     synchronized (lock) {
                         if (started.get() && !activeBindings.containsKey(ip)) {
                             activeBindings.put(ip, binding);
                         } else {
-                            binding.close();
+                            discardBinding = true;
                         }
+                    }
+                    if (discardBinding) {
+                        closeBindingsWithTimeout(Collections.singletonList(binding), closeTimeoutMs);
                     }
                 }
             } catch (Exception ignored) {
@@ -390,11 +403,39 @@ public class MdnsManager implements AutoCloseable {
             peersByDeviceId.clear();
             lastPairAckByDeviceId.clear();
         }
-        for (MdnsNicBinding binding : bindings) {
-            try {
-                binding.close();
-            } catch (Exception ignored) {
-            }
+        closeBindingsWithTimeout(bindings, closeTimeoutMs);
+    }
+
+    /**
+     * Closes all per-NIC mDNS bindings in parallel on daemon threads with a bounded timeout so
+     * a slow/stalled NIC or JmDNS state machine never hangs engine shutdown.
+     */
+    private static void closeBindingsWithTimeout(List<MdnsNicBinding> bindings, long timeoutMs) {
+        if (bindings == null || bindings.isEmpty()) {
+            return;
+        }
+        final CountDownLatch latch = new CountDownLatch(bindings.size());
+        for (int i = 0; i < bindings.size(); i++) {
+            final MdnsNicBinding binding = bindings.get(i);
+            final String suffix = (binding != null && binding.getBoundIp() != null)
+                    ? binding.getBoundIp() : String.valueOf(i);
+            Thread closer = new Thread(() -> {
+                try {
+                    if (binding != null) {
+                        binding.close();
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    latch.countDown();
+                }
+            }, "hfx-mdns-close-" + suffix);
+            closer.setDaemon(true);
+            closer.start();
+        }
+        try {
+            latch.await(Math.max(50L, timeoutMs), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 

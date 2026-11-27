@@ -11,10 +11,13 @@ namespace HybridFileXferLauncher;
 public sealed class EngineStdioBridge : IAsyncDisposable
 {
     private readonly Process _process;
+    private readonly ChildProcessJobObject? _jobObject;
     private readonly SemaphoreSlim _writeLock = new(1, 1);
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> _pending = new();
     private readonly CancellationTokenSource _cts = new();
     private long _nextId;
+    private int _terminated;
+    private int _disposed;
     private Task? _stdoutLoop;
     private Task? _stderrLoop;
 
@@ -22,11 +25,25 @@ public sealed class EngineStdioBridge : IAsyncDisposable
     public event Action<string>? StderrReceived;
     public event Action<int>? Exited;
 
-    public bool HasExited => _process.HasExited;
+    public bool HasExited
+    {
+        get
+        {
+            try
+            {
+                return _process.HasExited;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+    }
 
-    private EngineStdioBridge(Process process)
+    private EngineStdioBridge(Process process, ChildProcessJobObject? jobObject)
     {
         _process = process;
+        _jobObject = jobObject;
     }
 
     public static EngineStdioBridge Start(string engineJarPath, IReadOnlyList<string>? extraEngineArgs = null)
@@ -64,7 +81,20 @@ public sealed class EngineStdioBridge : IAsyncDisposable
             throw new InvalidOperationException("Failed to start hfx-engine Java process.");
         }
 
-        var bridge = new EngineStdioBridge(proc);
+        ChildProcessJobObject? jobObject = null;
+        try
+        {
+            jobObject = new ChildProcessJobObject();
+            jobObject.AssignProcess(proc);
+        }
+        catch (Exception ex)
+        {
+            jobObject?.Dispose();
+            jobObject = null;
+            Console.Error.WriteLine($"[WARN] Could not attach Win32 Job Object to child JVM: {ex.Message}");
+        }
+
+        var bridge = new EngineStdioBridge(proc, jobObject);
         proc.Exited += (_, _) =>
         {
             var code = 0;
@@ -196,16 +226,124 @@ public sealed class EngineStdioBridge : IAsyncDisposable
         }
     }
 
-    public async ValueTask DisposeAsync()
+    /// <summary>
+    /// Synchronous shutdown helper invoked from Win32 {@code SetConsoleCtrlHandler}
+    /// ({@code CTRL_CLOSE_EVENT} / {@code CTRL_LOGOFF_EVENT} / {@code CTRL_SHUTDOWN_EVENT})
+    /// and {@code AppDomain.ProcessExit}. Sends a best-effort {@code engine.shutdown} + stdin EOF,
+    /// waits briefly for clean exit, then force-kills the process tree and closes the Job Object.
+    /// </summary>
+    public void ShutdownSyncAndKill(TimeSpan gracefulTimeout)
+    {
+        if (Interlocked.Exchange(ref _terminated, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (!HasExited)
+            {
+                TrySendBestEffortShutdownAndCloseStdin();
+                var waitMs = (int)Math.Clamp(gracefulTimeout.TotalMilliseconds, 100, 3500);
+                try
+                {
+                    _process.WaitForExit(waitMs);
+                }
+                catch
+                {
+                }
+            }
+        }
+        finally
+        {
+            ForceKillAndReleaseJob();
+        }
+    }
+
+    private void TrySendBestEffortShutdownAndCloseStdin()
     {
         try
         {
-            if (!_process.HasExited)
+            var id = Interlocked.Increment(ref _nextId);
+            var shutdownJson = $"{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"engine.shutdown\"}}";
+            if (_writeLock.Wait(200))
             {
-                using var shutdownCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                try
+                {
+                    _process.StandardInput.WriteLine(shutdownJson);
+                    _process.StandardInput.Flush();
+                    _process.StandardInput.Close();
+                }
+                finally
+                {
+                    _writeLock.Release();
+                }
+            }
+            else
+            {
+                _process.StandardInput.Close();
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    private void ForceKillAndReleaseJob()
+    {
+        try
+        {
+            if (!HasExited)
+            {
+                _process.Kill(entireProcessTree: true);
+                _process.WaitForExit(1000);
+            }
+        }
+        catch
+        {
+        }
+
+        try
+        {
+            _jobObject?.Dispose();
+        }
+        catch
+        {
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0)
+        {
+            return;
+        }
+
+        try
+        {
+            if (Interlocked.Exchange(ref _terminated, 1) == 0 && !HasExited)
+            {
+                using var shutdownCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(2500));
                 try
                 {
                     await CallAsync("engine.shutdown", null, shutdownCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                }
+
+                try
+                {
+                    _process.StandardInput.Close();
+                }
+                catch
+                {
+                }
+
+                try
+                {
+                    using var exitWaitCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(2500));
+                    await _process.WaitForExitAsync(exitWaitCts.Token).ConfigureAwait(false);
                 }
                 catch
                 {
@@ -215,17 +353,14 @@ public sealed class EngineStdioBridge : IAsyncDisposable
         finally
         {
             _cts.Cancel();
+            ForceKillAndReleaseJob();
             try
             {
-                if (!_process.HasExited)
-                {
-                    _process.Kill(entireProcessTree: true);
-                }
+                _process.Dispose();
             }
             catch
             {
             }
-            _process.Dispose();
             _writeLock.Dispose();
             _cts.Dispose();
         }

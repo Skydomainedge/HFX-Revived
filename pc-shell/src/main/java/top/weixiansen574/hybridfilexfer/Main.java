@@ -58,59 +58,72 @@ public class Main {
         engineConfig.defaultAutoSubnetBind = !opts.disableAutoBind;
         engineConfig.enableMdns = zeroConfigMode;
 
+        int exitCode = 0;
         try (PcEngineRuntime runtime = new PcEngineRuntime(engineConfig)) {
             Thread cliShutdownHook = new Thread(runtime::shutdown, "hfx-cli-shutdown");
             Runtime.getRuntime().addShutdownHook(cliShutdownHook);
-
-            if (zeroConfigMode) {
-                runZeroConfigOrPairMode(runtime, opts, cliShutdownHook);
-                return;
-            }
-
-            runtime.addEventListener((eventName, payload) -> handleEngineEvent(eventName, payload, opts.noToast));
-
-            IpcPayloads.SessionConnectParams connectParams = new IpcPayloads.SessionConnectParams();
-            if ("adb".equalsIgnoreCase(opts.connect)) {
-                connectParams.mode = "adb";
-                connectParams.serial = opts.device;
-                connectParams.adbPath = opts.adbPath;
-                connectParams.adbLegacy = opts.adbLegacy;
-                connectParams.adbStreams = opts.adbStreams;
-            } else {
-                connectParams.mode = "direct";
-                connectParams.host = opts.connect;
-            }
-            connectParams.port = ProtocolConstants.DEFAULT_CONTROL_PORT;
-            connectParams.homeDir = resolveEffectiveHomeDir(opts.homeDir);
-            connectParams.autoSubnetBind = !opts.disableAutoBind;
-
-            Strings.printf("connecting_control_channel",
-                    "adb".equals(connectParams.mode) ? "127.0.0.1 (ADB)" : connectParams.host);
             try {
-                runtime.connect(connectParams);
-            } catch (PcEngineRuntime.EngineException e) {
-                System.err.println("[ERROR] " + e.getMessage());
+                if (zeroConfigMode) {
+                    exitCode = runZeroConfigOrPairMode(runtime, opts);
+                } else {
+                    runtime.addEventListener((eventName, payload) -> handleEngineEvent(eventName, payload, opts.noToast));
+
+                    IpcPayloads.SessionConnectParams connectParams = new IpcPayloads.SessionConnectParams();
+                    if ("adb".equalsIgnoreCase(opts.connect)) {
+                        connectParams.mode = "adb";
+                        connectParams.serial = opts.device;
+                        connectParams.adbPath = opts.adbPath;
+                        connectParams.adbLegacy = opts.adbLegacy;
+                        connectParams.adbStreams = opts.adbStreams;
+                    } else {
+                        connectParams.mode = "direct";
+                        connectParams.host = opts.connect;
+                    }
+                    connectParams.port = ProtocolConstants.DEFAULT_CONTROL_PORT;
+                    connectParams.homeDir = resolveEffectiveHomeDir(opts.homeDir);
+                    connectParams.autoSubnetBind = !opts.disableAutoBind;
+
+                    Strings.printf("connecting_control_channel",
+                            "adb".equals(connectParams.mode) ? "127.0.0.1 (ADB)" : connectParams.host);
+                    boolean connectedOk = false;
+                    try {
+                        runtime.connect(connectParams);
+                        connectedOk = true;
+                    } catch (PcEngineRuntime.EngineException e) {
+                        System.err.println("[ERROR] " + e.getMessage());
+                        exitCode = 1;
+                    }
+
+                    if (connectedOk) {
+                        IpcDtos.EngineSnapshot snap = runtime.getSnapshot();
+                        if ("adb".equals(connectParams.mode) && snap.adb != null && snap.adb.available) {
+                            int effStreams = opts.adbStreams != null ? opts.adbStreams : snap.adb.recommendedStreams;
+                            System.out.printf("ADB: %s (v%s, libusb=%s, delayed_ack=%s, streams=%d)%n",
+                                    snap.adb.adbPath, snap.adb.version, snap.adb.hasLibusb, snap.adb.hasDelayedAck, effStreams);
+                            System.out.println(Strings.get("adb_forward_succeed"));
+                        }
+                        Strings.printf("connect_success");
+
+                        runtime.awaitSessionEnd();
+                    }
+                }
+            } finally {
                 removeShutdownHookQuietly(cliShutdownHook);
-                return;
             }
-
-            IpcDtos.EngineSnapshot snap = runtime.getSnapshot();
-            if ("adb".equals(connectParams.mode) && snap.adb != null && snap.adb.available) {
-                int effStreams = opts.adbStreams != null ? opts.adbStreams : snap.adb.recommendedStreams;
-                System.out.printf("ADB: %s (v%s, libusb=%s, delayed_ack=%s, streams=%d)%n",
-                        snap.adb.adbPath, snap.adb.version, snap.adb.hasLibusb, snap.adb.hasDelayedAck, effStreams);
-                System.out.println(Strings.get("adb_forward_succeed"));
-            }
-            Strings.printf("connect_success");
-
-            runtime.awaitSessionEnd();
-            removeShutdownHookQuietly(cliShutdownHook);
+        } catch (Throwable t) {
+            t.printStackTrace(System.err);
+            exitCode = 1;
         }
+
+        // P0-BUG-01: Explicitly terminate JVM after graceful PcEngineRuntime.close() so
+        // leaked non-daemon JmDNS 3.5.9 threads cannot hang DestroyJavaVM or hold JAR locks.
+        System.out.flush();
+        System.err.flush();
+        System.exit(exitCode);
     }
 
-    private static void runZeroConfigOrPairMode(PcEngineRuntime runtime,
-                                                CliOptions opts,
-                                                Thread shutdownHook) throws Exception {
+    private static int runZeroConfigOrPairMode(PcEngineRuntime runtime,
+                                               CliOptions opts) throws Exception {
         final CountDownLatch flowDone = new CountDownLatch(1);
         final AtomicBoolean connected = new AtomicBoolean(false);
 
@@ -157,8 +170,7 @@ public class Main {
                 runtime.startQrPairing(pairParams);
             } catch (PcEngineRuntime.EngineException e) {
                 System.err.println("[ERROR] " + e.getMessage());
-                removeShutdownHookQuietly(shutdownHook);
-                return;
+                return 1;
             }
             flowDone.await();
         }
@@ -166,7 +178,7 @@ public class Main {
         if (connected.get()) {
             runtime.awaitSessionEnd();
         }
-        removeShutdownHookQuietly(shutdownHook);
+        return 0;
     }
 
     private static void handleEngineEvent(String eventName, Object payload, boolean noToast) {
