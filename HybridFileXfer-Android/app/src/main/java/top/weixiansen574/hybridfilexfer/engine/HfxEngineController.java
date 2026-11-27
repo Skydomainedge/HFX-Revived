@@ -898,6 +898,7 @@ public class HfxEngineController implements AutoCloseable {
         boolean isUpload = "upload".equals(direction);
         ThrottledTransferCallback cb = new ThrottledTransferCallback(server, direction, isUpload);
         try {
+            boolean keepAlive;
             if (isUpload) {
                 List<RemoteFile> localFiles = new ArrayList<>(filePaths.size());
                 for (String fp : filePaths) {
@@ -905,7 +906,7 @@ public class HfxEngineController implements AutoCloseable {
                 }
                 Directory localDir = new Directory(srcDirPath, Directory.getCurrentFileSystem());
                 Directory remoteDir = new Directory(dstDirPath, remoteFs);
-                server.sendFilesToRemote(localFiles, localDir, remoteDir, cb);
+                keepAlive = server.sendFilesToRemote(localFiles, localDir, remoteDir, cb);
             } else {
                 List<RemoteFile> remoteFiles = new ArrayList<>(filePaths.size());
                 for (String fp : filePaths) {
@@ -913,11 +914,15 @@ public class HfxEngineController implements AutoCloseable {
                 }
                 Directory localDir = new Directory(dstDirPath, Directory.getCurrentFileSystem());
                 Directory remoteDir = new Directory(srcDirPath, remoteFs);
-                server.sendFilesToShelf(remoteFiles, localDir, remoteDir, cb);
+                keepAlive = server.sendFilesToShelf(remoteFiles, localDir, remoteDir, cb);
             }
             this.activeTransferDirection = null;
             this.lastTransferProgress = null;
-            if (state == SessionState.TRANSFERRING && sessionSeq.get() == mySessionId) {
+            if (!keepAlive) {
+                if (sessionSeq.get() == mySessionId) {
+                    stopServer();
+                }
+            } else if (state == SessionState.TRANSFERRING && sessionSeq.get() == mySessionId) {
                 transitionIfCurrent(mySessionId, SessionState.CONNECTED, "Transfer finished");
             }
         } catch (Exception e) {

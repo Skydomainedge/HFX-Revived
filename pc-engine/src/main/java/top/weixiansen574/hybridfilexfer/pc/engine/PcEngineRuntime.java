@@ -785,7 +785,7 @@ public class PcEngineRuntime implements AutoCloseable {
 
             Thread loopThread = new Thread(() -> {
                 try {
-                    establishedClient.start(createPeerEventCallback(establishedClient), loopReady::countDown);
+                    establishedClient.start(createPeerEventCallback(establishedClient, establishedAdb), loopReady::countDown);
                 } catch (Exception e) {
                     if (activeClient == establishedClient && !closed.get()) {
                         emitEvent(IpcEvents.DIAGNOSTIC_WARNING,
@@ -827,11 +827,17 @@ public class PcEngineRuntime implements AutoCloseable {
             this.activeAdbManager = null;
             this.activeRails = Collections.emptyList();
         }
-        if (clientToClose != null) {
-            clientToClose.disconnectGracefully();
-        }
-        if (adbToClose != null) {
-            adbToClose.close();
+        try {
+            if (clientToClose != null) {
+                clientToClose.disconnectGracefully();
+            }
+        } finally {
+            if (adbToClose != null) {
+                try {
+                    adbToClose.close();
+                } catch (Exception ignored) {
+                }
+            }
         }
         emitRailStatus(Collections.emptyList());
         transitionState(SessionState.IDLE, "Disconnected");
@@ -1032,12 +1038,13 @@ public class PcEngineRuntime implements AutoCloseable {
                 emitEvent(IpcEvents.TRANSFER_ERROR, err);
             }
             if (activeClient == client) {
-                transitionState(SessionState.ERROR, errMessage(e));
+                // Tear down broken client + ADB forward so neither sockets nor adb forwards leak on error
+                disconnect();
             }
         }
     }
 
-    private ClientCallBack createPeerEventCallback(JdkHFXClient client) {
+    private ClientCallBack createPeerEventCallback(JdkHFXClient client, AdbManager sessionAdb) {
         final AtomicReference<ThrottledTransferCallback> currentCb = new AtomicReference<>(null);
         return new ClientCallBack() {
             @Override
@@ -1056,7 +1063,7 @@ public class PcEngineRuntime implements AutoCloseable {
 
             @Override
             public void onExit() {
-                onSessionTerminated(client, activeAdbManager);
+                onSessionTerminated(client, sessionAdb);
             }
 
             @Override
@@ -1280,7 +1287,10 @@ public class PcEngineRuntime implements AutoCloseable {
         }
         if (shouldReset) {
             if (adbToClose != null) {
-                adbToClose.close();
+                try {
+                    adbToClose.close();
+                } catch (Exception ignored) {
+                }
             }
             emitRailStatus(Collections.emptyList());
             transitionState(SessionState.IDLE, "Session closed");

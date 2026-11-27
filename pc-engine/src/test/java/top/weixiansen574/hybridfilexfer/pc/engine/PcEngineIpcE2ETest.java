@@ -496,6 +496,125 @@ public class PcEngineIpcE2ETest {
         }
     }
 
+    @Test
+    public void testAdbSessionCleansUpForwardAndAllowsImmediateReconnectAfterTransferAbort() throws Exception {
+        File fakeAdb = tempFolder.newFile("adb_reconnect.exe");
+        File pcRoot = tempFolder.newFolder("pc_adb_drop");
+        File serverRoot = tempFolder.newFolder("srv_adb_drop");
+        File uploadFile = new File(pcRoot, "drop_4mb.bin");
+        writeRandomFile(uploadFile, 4 * 1024 * 1024, 5555L);
+
+        AtomicInteger forwardAddCount = new AtomicInteger(0);
+        AtomicInteger forwardRemoveCount = new AtomicInteger(0);
+        AtomicInteger offlineRecoveries = new AtomicInteger(0);
+        final boolean[] simulateOfflineOnNextConnect = new boolean[]{false};
+
+        AdbManager.CommandExecutor fakeExec = (cmd, envSpec, wd, timeoutMs) -> {
+            if (cmd.contains("version")) {
+                return new AdbManager.CommandResult(0,
+                        "Android Debug Bridge version 1.0.41\nVersion 35.0.2-12147458\n", "");
+            }
+            if (cmd.contains("host-features") || cmd.contains("features")) {
+                return new AdbManager.CommandResult(0, "shell_v2,sendrecv_v2\n", "");
+            }
+            if (cmd.contains("reconnect") && cmd.contains("offline")) {
+                offlineRecoveries.incrementAndGet();
+                simulateOfflineOnNextConnect[0] = false;
+                return new AdbManager.CommandResult(0, "reconnecting SER1\n", "");
+            }
+            if (cmd.contains("devices")) {
+                String st = simulateOfflineOnNextConnect[0] ? "offline" : "device";
+                return new AdbManager.CommandResult(0, "List of devices attached\nSER1\t" + st + "\n", "");
+            }
+            if (cmd.contains("forward") && cmd.contains("--remove")) {
+                forwardRemoveCount.incrementAndGet();
+                return new AdbManager.CommandResult(0, "", "");
+            }
+            if (cmd.contains("forward")) {
+                if (simulateOfflineOnNextConnect[0]) {
+                    return new AdbManager.CommandResult(1, "", "adb.exe: device offline");
+                }
+                forwardAddCount.incrementAndGet();
+                return new AdbManager.CommandResult(0, "5740\n", "");
+            }
+            return new AdbManager.CommandResult(0, "", "");
+        };
+        AdbManager.EnvironmentProvider fakeEnv = new AdbManager.EnvironmentProvider() {
+            @Override public String getEnv(String name) { return null; }
+            @Override public boolean isWindows() { return true; }
+            @Override public String getPathSeparator() { return ";"; }
+            @Override public boolean isExecutableFile(File file) {
+                return file.getAbsolutePath().equals(fakeAdb.getAbsolutePath());
+            }
+            @Override public String canonicalizePath(File file) { return file.getAbsolutePath(); }
+        };
+
+        PcEngineRuntime.EngineConfig cfg = new PcEngineRuntime.EngineConfig();
+        cfg.enableMdns = false;
+        cfg.adbConfig.explicitAdbPath = fakeAdb.getAbsolutePath();
+        cfg.adbConfig.offlinePollIntervalMs = 10L;
+        cfg.adbConfig.offlineRecoveryWaitMs = 1000L;
+
+        try (PcEngineRuntime runtime = new PcEngineRuntime(
+                cfg, null, null,
+                (adbCfg, listener) -> new AdbManager(adbCfg, fakeExec, fakeEnv, listener))) {
+
+            // Session 1: connect via ADB, start transfer, then abruptly kill server (simulating crash)
+            CountDownLatch session1ReturnedIdle = new CountDownLatch(1);
+            runtime.addEventListener((ev, payload) -> {
+                if (IpcEvents.SESSION_STATE_CHANGED.equals(ev)
+                        && payload instanceof IpcPayloads.SessionStateChangedPayload) {
+                    IpcPayloads.SessionStateChangedPayload sc = (IpcPayloads.SessionStateChangedPayload) payload;
+                    if (sc.prev == SessionState.TRANSFERRING && sc.current == SessionState.IDLE) {
+                        session1ReturnedIdle.countDown();
+                    }
+                }
+            });
+
+            try (RunningServer srv1 = new RunningServer()) {
+                IpcPayloads.SessionConnectParams p1 = new IpcPayloads.SessionConnectParams();
+                p1.mode = "adb";
+                p1.serial = "SER1";
+                p1.port = srv1.port();
+                p1.homeDir = pcRoot.getAbsolutePath();
+                assertTrue(runtime.connect(p1).ok);
+                assertTrue(srv1.connected.await(5, TimeUnit.SECONDS));
+                assertTrue(srv1.loopStarted.await(5, TimeUnit.SECONDS));
+                assertEquals(1, forwardAddCount.get());
+
+                IpcPayloads.TransferStartParams up = new IpcPayloads.TransferStartParams();
+                up.direction = "upload";
+                up.files = Collections.singletonList(uploadFile.getAbsolutePath());
+                up.srcDir = pcRoot.getAbsolutePath();
+                up.dstDir = serverRoot.getAbsolutePath();
+                runtime.startTransfer(up);
+
+                // Abruptly tear down server mid-transfer
+                srv1.server.close();
+                assertTrue("Runtime must converge cleanly to IDLE after mid-transfer break",
+                        session1ReturnedIdle.await(5, TimeUnit.SECONDS));
+                assertTrue("ADB forward --remove must be cleaned up on abnormal transfer teardown",
+                        forwardRemoveCount.get() >= 1);
+            }
+
+            // Session 2: even if ADB transport momentarily landed offline, reconnect must self-heal and succeed!
+            simulateOfflineOnNextConnect[0] = true;
+            try (RunningServer srv2 = new RunningServer()) {
+                IpcPayloads.SessionConnectParams p2 = new IpcPayloads.SessionConnectParams();
+                p2.mode = "adb";
+                p2.serial = "SER1";
+                p2.port = srv2.port();
+                p2.homeDir = pcRoot.getAbsolutePath();
+                assertTrue("Reconnect after offline recovery must succeed", runtime.connect(p2).ok);
+                assertTrue(srv2.connected.await(5, TimeUnit.SECONDS));
+                assertEquals(SessionState.CONNECTED, runtime.getState());
+                assertEquals(1, offlineRecoveries.get());
+                runtime.disconnect();
+                assertEquals(SessionState.IDLE, runtime.getState());
+            }
+        }
+    }
+
     private void runFullHeadlessWorkflow(NdjsonRpcClient client,
                                          String token,
                                          RunningServer srv,

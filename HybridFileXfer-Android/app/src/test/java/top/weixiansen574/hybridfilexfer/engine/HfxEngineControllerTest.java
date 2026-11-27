@@ -367,6 +367,104 @@ public class HfxEngineControllerTest {
     }
 
     @Test
+    public void testControllerTearsDownCleanlyWhenPeerDropsMidTransfer() throws Exception {
+        final File phoneRoot = tempFolder.newFolder("phone_drop_fs");
+        final File pcRoot = tempFolder.newFolder("pc_drop_fs");
+        File bigFile = new File(phoneRoot, "drop_4mb.bin");
+        writeRandomFile(bigFile, 4 * 1024 * 1024, 6060L);
+
+        final CountDownLatch serverBoundLatch = new CountDownLatch(1);
+        final CountDownLatch connectedLatch = new CountDownLatch(1);
+        final CountDownLatch returnedIdleLatch = new CountDownLatch(1);
+        final CountDownLatch releasedServerLatch = new CountDownLatch(1);
+
+        HfxEngineController.ServerSessionBackend backend = new HfxEngineController.ServerSessionBackend() {
+            @Override
+            public AbstractHFXServer acquireServer(int ioMode) {
+                LoopbackServer s = new LoopbackServer();
+                s.setPreferredBlockSize(256 * 1024);
+                s.setTransferAbortTimeoutMs(400L);
+                return s;
+            }
+            @Override public void releaseServer(AbstractHFXServer server) { releasedServerLatch.countDown(); }
+            @Override public List<RemoteFile> listLocalFiles(AbstractHFXServer server, String path) { return Utils.listRemoteFiles(path); }
+            @Override public boolean createLocalDir(AbstractHFXServer server, String parent, String child) { return new File(parent, child).mkdirs(); }
+            @Override public boolean deleteLocalFile(AbstractHFXServer server, String path) { return new File(path).delete(); }
+            @Override public RemoteFile resolveLocalFile(AbstractHFXServer server, String path) { return new RemoteFile(new File(path)); }
+        };
+
+        try (HfxEngineController controller = new HfxEngineController("android-drop-1", "TestPhone",
+                new UsbNicAdvisor(), backend, 250L)) {
+            controller.addEventListener((eventName, payload) -> {
+                if (IpcEvents.RAIL_STATUS.equals(eventName) && payload instanceof IpcPayloads.RailStatusPayload) {
+                    for (IpcDtos.RailStatusInfo r : ((IpcPayloads.RailStatusPayload) payload).rails) {
+                        if ("WAITING".equals(r.state)) serverBoundLatch.countDown();
+                    }
+                } else if (IpcEvents.SESSION_STATE_CHANGED.equals(eventName)
+                        && payload instanceof IpcPayloads.SessionStateChangedPayload) {
+                    IpcPayloads.SessionStateChangedPayload sc = (IpcPayloads.SessionStateChangedPayload) payload;
+                    if (sc.current == SessionState.CONNECTED) connectedLatch.countDown();
+                    if (sc.prev == SessionState.TRANSFERRING && sc.current == SessionState.IDLE) returnedIdleLatch.countDown();
+                }
+            });
+
+            int freePort;
+            try (java.net.ServerSocket probe = new java.net.ServerSocket(0)) {
+                freePort = probe.getLocalPort();
+            }
+            IpcPayloads.ServerStartParams startParams = new IpcPayloads.ServerStartParams();
+            startParams.port = freePort;
+            startParams.localBufferCount = 16;
+            startParams.remoteBufferCount = 16;
+            IpcDtos.RailSelection sel = new IpcDtos.RailSelection();
+            sel.name = "USB_ADB";
+            sel.ip = "127.0.0.1";
+            sel.railType = RailType.ADB.name();
+            sel.streamCount = 2;
+            startParams.selectedRails.add(sel);
+
+            assertTrue(IpcJson.fromJson(
+                    controller.dispatchCommandJson(IpcMethods.SERVER_START, IpcJson.toJson(startParams)),
+                    JsonRpcResponse.class).isSuccess());
+            assertTrue(serverBoundLatch.await(5, TimeUnit.SECONDS));
+
+            LoopbackClient client = new LoopbackClient("127.0.0.1", freePort, pcRoot.getAbsolutePath());
+            client.setTransferAbortTimeoutMs(400L);
+            ExecutorService clientExec = Executors.newSingleThreadExecutor();
+            try {
+                assertTrue(client.connect(new NoOpConnectCallback()));
+                assertTrue(connectedLatch.await(5, TimeUnit.SECONDS));
+                clientExec.submit(() -> {
+                    try {
+                        client.start(null);
+                    } catch (Exception ignored) {
+                    }
+                });
+                Thread.sleep(50L);
+
+                IpcPayloads.TransferStartParams up = new IpcPayloads.TransferStartParams();
+                up.direction = "upload";
+                up.files = Collections.singletonList(bigFile.getAbsolutePath());
+                up.srcDir = phoneRoot.getAbsolutePath();
+                up.dstDir = pcRoot.getAbsolutePath();
+                assertTrue(controller.dispatch(null, IpcMethods.TRANSFER_START, IpcJson.toJsonObject(up)).isSuccess());
+
+                // Abruptly cut client mid-transfer
+                client.requestShutdown();
+
+                assertTrue("Controller must transition to IDLE without hanging on broken transfer",
+                        returnedIdleLatch.await(5, TimeUnit.SECONDS));
+                assertTrue("Backend releaseServer must be invoked",
+                        releasedServerLatch.await(5, TimeUnit.SECONDS));
+                assertEquals(SessionState.IDLE, controller.getState());
+            } finally {
+                client.requestShutdown();
+                clientExec.shutdownNow();
+            }
+        }
+    }
+
+    @Test
     public void testHfxServerStaticInstanceCompletelyRemovedFromBytecodeAndSources() throws Exception {
         // 1) Reflection check: HFXServer must NOT declare any 'instance' field
         for (Field f : HFXServer.class.getDeclaredFields()) {

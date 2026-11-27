@@ -6,6 +6,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -16,6 +17,8 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.ReentrantLock;
 
 import top.weixiansen574.hybridfilexfer.core.bean.Directory;
 import top.weixiansen574.hybridfilexfer.core.bean.RemoteFile;
@@ -28,8 +31,11 @@ import top.weixiansen574.nio.DataByteChannel;
 public abstract class HFXService {
     public static final String CLIENT_HEADER = ProtocolConstants.MAGIC_CONTROL;
     public static final int VERSION_CODE = ProtocolConstants.VERSION_CODE;
+    public static final long DEFAULT_TRANSFER_ABORT_TIMEOUT_MS = 2500L;
+    public static final long DEFAULT_SHUTDOWN_LOCK_TIMEOUT_MS = 400L;
 
     protected final Object controlLock = new Object();
+    private final ReentrantLock controlAccessLock = new ReentrantLock();
     private final Object loopStateLock = new Object();
     private volatile Selector controlSelector;
     private volatile Thread controlLoopThread;
@@ -43,10 +49,14 @@ public abstract class HFXService {
     protected int negotiatedBlockSize = ProtocolConstants.DEFAULT_BLOCK_SIZE;
     protected int negotiatedCapabilities = 0;
     protected long speedMonitorIntervalMs = SpeedMonitorThread.DEFAULT_INTERVAL_MS;
+    protected long transferAbortTimeoutMs = DEFAULT_TRANSFER_ABORT_TIMEOUT_MS;
 
     private volatile ReadFileCall activeReadFileCall;
     private volatile Thread activeReadThread;
     private volatile WriteFileCall activeWriteFileCall;
+    private volatile boolean transferInProgress = false;
+    private volatile List<Thread> activeTransferThreads = Collections.emptyList();
+    private volatile Selector activeTransferControlSelector;
 
     protected interface ControlCommandHandler {
         boolean handleCommand(short commandId) throws Exception;
@@ -68,6 +78,72 @@ public abstract class HFXService {
 
     public void setSpeedMonitorIntervalMs(long intervalMs) {
         this.speedMonitorIntervalMs = Math.max(100L, intervalMs);
+    }
+
+    public void setTransferAbortTimeoutMs(long timeoutMs) {
+        this.transferAbortTimeoutMs = Math.max(200L, timeoutMs);
+    }
+
+    protected boolean isTransferInProgress() {
+        return transferInProgress;
+    }
+
+    protected void closeTransferConnectionsQuietly() {
+        List<TransferConnection> conns = this.connections;
+        if (conns != null) {
+            for (TransferConnection conn : conns) {
+                if (conn != null) {
+                    try {
+                        conn.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
+        }
+    }
+
+    protected void awaitTransferThreadsQuietly(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + Math.max(50L, timeoutMs);
+        List<Thread> workers = this.activeTransferThreads;
+        Thread readThread = this.activeReadThread;
+        if (readThread != null && readThread.isAlive()) {
+            readThread.interrupt();
+        }
+        if (workers != null) {
+            for (Thread t : workers) {
+                if (t != null && t.isAlive()) {
+                    t.interrupt();
+                }
+            }
+        }
+        if (readThread != null && readThread != Thread.currentThread()) {
+            long rem = deadline - System.currentTimeMillis();
+            if (rem > 0L) {
+                try {
+                    readThread.join(rem);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
+        if (workers != null) {
+            for (Thread t : workers) {
+                if (t == null || t == Thread.currentThread()) {
+                    continue;
+                }
+                long rem = deadline - System.currentTimeMillis();
+                if (rem <= 0L) {
+                    break;
+                }
+                try {
+                    t.join(rem);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+        }
     }
 
     public boolean isSessionActive() {
@@ -160,6 +236,10 @@ public abstract class HFXService {
             wfc.cancelWithError("Transfer cancelled");
             signalled = true;
         }
+        Selector transferSel = this.activeTransferControlSelector;
+        if (transferSel != null) {
+            transferSel.wakeup();
+        }
         return signalled;
     }
 
@@ -246,7 +326,8 @@ public abstract class HFXService {
                 }
 
                 if (readable) {
-                    synchronized (controlLock) {
+                    controlAccessLock.lock();
+                    try {
                         if (!controlLoopRunning || !ch.isOpen()) {
                             break;
                         }
@@ -256,6 +337,8 @@ public abstract class HFXService {
                             controlLoopRunning = false;
                             break;
                         }
+                    } finally {
+                        controlAccessLock.unlock();
                     }
                 }
             }
@@ -338,11 +421,14 @@ public abstract class HFXService {
             }
         }
         try {
-            synchronized (controlLock) {
+            controlAccessLock.lock();
+            try {
                 if (ctChannel == null || !ctChannel.isOpen()) {
                     throw new IOException("Control channel is closed");
                 }
                 return action.run();
+            } finally {
+                controlAccessLock.unlock();
             }
         } finally {
             if (pausedLoop) {
@@ -354,42 +440,162 @@ public abstract class HFXService {
         }
     }
 
+    /**
+     * Bounded, non-deadlocking variant of {@link #executeWithControlLock(ControlAction)} intended
+     * for best-effort {@code SHUTDOWN} signalling during teardown. Never blocks indefinitely if
+     * a transfer or peer RPC currently holds the control channel lock.
+     */
+    protected boolean tryExecuteWithControlLock(ControlAction<Void> action, long timeoutMs) {
+        if (transferInProgress) {
+            return false;
+        }
+        long deadline = System.currentTimeMillis() + Math.max(50L, timeoutMs);
+        boolean pausedLoop = false;
+        synchronized (loopStateLock) {
+            if (controlLoopRunning && Thread.currentThread() != controlLoopThread) {
+                while (localTurnRequested && controlLoopRunning) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0L || transferInProgress) {
+                        return false;
+                    }
+                    try {
+                        loopStateLock.wait(Math.min(50L, remaining));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+                if (controlLoopRunning) {
+                    localTurnRequested = true;
+                    pausedLoop = true;
+                    Selector sel = controlSelector;
+                    if (sel != null) {
+                        sel.wakeup();
+                    }
+                    while (!loopPausedForLocal && controlLoopRunning) {
+                        long remaining = deadline - System.currentTimeMillis();
+                        if (remaining <= 0L || transferInProgress) {
+                            localTurnRequested = false;
+                            loopStateLock.notifyAll();
+                            return false;
+                        }
+                        try {
+                            loopStateLock.wait(Math.min(50L, remaining));
+                            Selector s2 = controlSelector;
+                            if (s2 != null) {
+                                s2.wakeup();
+                            }
+                        } catch (InterruptedException e) {
+                            localTurnRequested = false;
+                            loopStateLock.notifyAll();
+                            Thread.currentThread().interrupt();
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        boolean locked = false;
+        try {
+            long remaining = Math.max(1L, deadline - System.currentTimeMillis());
+            locked = controlAccessLock.tryLock(remaining, TimeUnit.MILLISECONDS);
+            if (!locked) {
+                return false;
+            }
+            if (ctChannel == null || !ctChannel.isOpen()) {
+                return false;
+            }
+            action.run();
+            return true;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        } catch (IOException e) {
+            return false;
+        } finally {
+            if (locked) {
+                controlAccessLock.unlock();
+            }
+            if (pausedLoop) {
+                synchronized (loopStateLock) {
+                    localTurnRequested = false;
+                    loopStateLock.notifyAll();
+                }
+            }
+        }
+    }
+
     protected boolean sendFiles(List<RemoteFile> fileList, Directory localDir, Directory remoteDir,
                                 TransferFileCallback callback) throws IOException {
-        ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size());
+        final ReadFileCall readFileCall = createReadFileCall(buffers, fileList, localDir, remoteDir, connections.size());
         FutureTask<Void> readFileTask = new FutureTask<>(readFileCall);
-        Thread readThread = new Thread(readFileTask, "FileRead");
+        final Thread readThread = new Thread(readFileTask, "FileRead");
+        readThread.setDaemon(true);
+        this.transferInProgress = true;
         this.activeReadFileCall = readFileCall;
         this.activeReadThread = readThread;
         readThread.start();
 
         SpeedMonitorThread speedMonitorThread = new SpeedMonitorThread(connections, callback, speedMonitorIntervalMs);
         speedMonitorThread.setName("SpeedMonitor");
+        speedMonitorThread.setDaemon(true);
         speedMonitorThread.start();
+
+        final AtomicBoolean dataChannelBroken = new AtomicBoolean(false);
+        List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
+        List<Thread> transferThreads = new ArrayList<>(connections.size());
 
         try {
             long startTime = System.currentTimeMillis();
-            List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
+            Runnable onBreak = new Runnable() {
+                @Override
+                public void run() {
+                    if (dataChannelBroken.compareAndSet(false, true)) {
+                        readFileCall.shutdownByConnectionBreak();
+                        readThread.interrupt();
+                        Selector sel = activeTransferControlSelector;
+                        if (sel != null) {
+                            sel.wakeup();
+                        }
+                    }
+                }
+            };
             for (TransferConnection connection : connections) {
-                FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback));
+                FutureTask<Void> task = new FutureTask<>(new SendFileCall(readFileCall, connection, callback, onBreak));
                 transferTasks.add(task);
                 Thread thread = new Thread(task, "UL_" + connection.getStreamLabel());
+                thread.setDaemon(true);
+                transferThreads.add(thread);
                 thread.start();
             }
+            this.activeTransferThreads = transferThreads;
 
             boolean complete;
             try {
-                complete = ctChannel.readBoolean();
+                complete = readControlBooleanWithAbortAwareness(dataChannelBroken, transferAbortTimeoutMs);
             } catch (IOException e) {
                 speedMonitorThread.cancel();
                 readFileCall.shutdownByConnectionBreak();
+                readThread.interrupt();
+                closeTransferConnectionsQuietly();
+                abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
                 callback.onIncomplete();
                 return false;
             }
             speedMonitorThread.cancel();
 
             if (!complete) {
-                String errMsg = ctChannel.readUTF();
+                String errMsg;
+                try {
+                    errMsg = ctChannel.readUTF();
+                } catch (IOException e) {
+                    readFileCall.shutdownByConnectionBreak();
+                    readThread.interrupt();
+                    closeTransferConnectionsQuietly();
+                    abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
+                    callback.onIncomplete();
+                    return false;
+                }
                 callback.onWriteFileError(errMsg);
                 readFileCall.shutdownByWriteError();
                 for (FutureTask<Void> transferTask : transferTasks) {
@@ -401,13 +607,40 @@ public abstract class HFXService {
                 return true;
             }
 
+            if (dataChannelBroken.get()) {
+                readFileCall.shutdownByConnectionBreak();
+                readThread.interrupt();
+                closeTransferConnectionsQuietly();
+                abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
+                callback.onIncomplete();
+                return false;
+            }
+
+            boolean taskFailed = false;
+            long joinDeadline = System.currentTimeMillis() + Math.max(200L, transferAbortTimeoutMs);
             for (FutureTask<Void> transferTask : transferTasks) {
                 try {
-                    transferTask.get();
-                } catch (ExecutionException | InterruptedException e) {
-                    callback.onIncomplete();
-                    return false;
+                    if (dataChannelBroken.get()) {
+                        long rem = Math.max(1L, joinDeadline - System.currentTimeMillis());
+                        transferTask.get(rem, TimeUnit.MILLISECONDS);
+                    } else {
+                        transferTask.get();
+                    }
+                } catch (ExecutionException | InterruptedException | TimeoutException e) {
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
+                    taskFailed = true;
+                    break;
                 }
+            }
+            if (taskFailed || dataChannelBroken.get()) {
+                readFileCall.shutdownByConnectionBreak();
+                readThread.interrupt();
+                closeTransferConnectionsQuietly();
+                abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
+                callback.onIncomplete();
+                return false;
             }
 
             long totalUploadTraffic = 0;
@@ -433,6 +666,10 @@ public abstract class HFXService {
                 ctChannel.writeUTF(ex);
                 callback.onReadFileError(ex);
                 return true;
+            } catch (IOException e) {
+                closeTransferConnectionsQuietly();
+                callback.onIncomplete();
+                return false;
             }
 
             long elapsed = Math.max(1L, System.currentTimeMillis() - startTime);
@@ -440,33 +677,53 @@ public abstract class HFXService {
             return true;
         } finally {
             speedMonitorThread.cancel();
+            this.transferInProgress = false;
             this.activeReadFileCall = null;
             this.activeReadThread = null;
+            this.activeTransferThreads = Collections.emptyList();
         }
     }
 
     protected boolean receiveFiles(TransferFileCallback callback) throws IOException {
         WriteFileCall writeFileCall = createWriteFileCall(buffers, connections.size());
+        this.transferInProgress = true;
         this.activeWriteFileCall = writeFileCall;
         long startTime = System.currentTimeMillis();
 
         SpeedMonitorThread speedMonitorThread = new SpeedMonitorThread(connections, callback, speedMonitorIntervalMs);
         speedMonitorThread.setName("SpeedMonitor");
+        speedMonitorThread.setDaemon(true);
         speedMonitorThread.start();
 
+        final AtomicBoolean dataChannelBroken = new AtomicBoolean(false);
+        List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
+        List<Thread> transferThreads = new ArrayList<>(connections.size());
+
         try {
-            List<FutureTask<Void>> transferTasks = new ArrayList<>(connections.size());
+            Runnable onBreak = new Runnable() {
+                @Override
+                public void run() {
+                    dataChannelBroken.set(true);
+                }
+            };
             for (int i = 0; i < connections.size(); i++) {
                 TransferConnection connection = connections.get(i);
                 FutureTask<Void> task = new FutureTask<>(
-                        new ReceiveFileCall(i, connection, writeFileCall, callback, negotiatedBlockSize));
+                        new ReceiveFileCall(i, connection, writeFileCall, callback, negotiatedBlockSize, onBreak));
                 transferTasks.add(task);
                 Thread thread = new Thread(task, "DL_" + connection.getStreamLabel());
+                thread.setDaemon(true);
+                transferThreads.add(thread);
                 thread.start();
             }
 
             FutureTask<Void> writeFileTask = new FutureTask<>(writeFileCall);
             Thread writeThread = new Thread(writeFileTask, "FileWrite");
+            writeThread.setDaemon(true);
+            List<Thread> allWorkers = new ArrayList<>(transferThreads.size() + 1);
+            allWorkers.addAll(transferThreads);
+            allWorkers.add(writeThread);
+            this.activeTransferThreads = allWorkers;
             writeThread.start();
 
             try {
@@ -474,12 +731,19 @@ public abstract class HFXService {
             } catch (InterruptedException | ExecutionException e) {
                 speedMonitorThread.cancel();
                 Throwable cause = e.getCause();
-                ctChannel.writeBoolean(false);
                 String ex = cause != null ? cause.getMessage() : e.toString();
                 if (ex == null || ex.isEmpty()) {
                     ex = cause != null ? cause.toString() : e.toString();
                 }
-                ctChannel.writeUTF(ex);
+                try {
+                    ctChannel.writeBoolean(false);
+                    ctChannel.writeUTF(ex);
+                } catch (IOException ioEx) {
+                    closeTransferConnectionsQuietly();
+                    abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
+                    callback.onIncomplete();
+                    return false;
+                }
                 for (FutureTask<Void> task : transferTasks) {
                     try {
                         task.get(3, TimeUnit.SECONDS);
@@ -490,33 +754,164 @@ public abstract class HFXService {
                 return true;
             }
 
+            if (dataChannelBroken.get()) {
+                speedMonitorThread.cancel();
+                closeTransferConnectionsQuietly();
+                abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
+                try {
+                    if (ctChannel != null && ctChannel.isOpen()) {
+                        ctChannel.writeBoolean(true);
+                    }
+                } catch (IOException ignored) {
+                }
+                callback.onIncomplete();
+                return false;
+            }
+
+            boolean boundedWait = writeFileCall.isCanceled();
+            long abortDeadline = System.currentTimeMillis() + Math.max(200L, transferAbortTimeoutMs);
             for (FutureTask<Void> task : transferTasks) {
                 try {
-                    task.get();
-                } catch (InterruptedException | ExecutionException e) {
+                    if (boundedWait || dataChannelBroken.get()) {
+                        long rem = abortDeadline - System.currentTimeMillis();
+                        if (rem <= 0L) {
+                            throw new TimeoutException("Timed out waiting for sibling data rail after transfer abort");
+                        }
+                        task.get(rem, TimeUnit.MILLISECONDS);
+                    } else {
+                        task.get();
+                    }
+                } catch (InterruptedException | ExecutionException | TimeoutException e) {
+                    if (e instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
+                    }
                     speedMonitorThread.cancel();
-                    ctChannel.writeBoolean(true);
+                    closeTransferConnectionsQuietly();
+                    abortAndJoinTransferTasks(transferTasks, transferThreads, 1500L);
+                    try {
+                        if (ctChannel != null && ctChannel.isOpen()) {
+                            ctChannel.writeBoolean(true);
+                        }
+                    } catch (IOException ignored) {
+                    }
                     callback.onIncomplete();
                     return false;
                 }
             }
 
             speedMonitorThread.cancel();
-            ctChannel.writeBoolean(true);
-            if (ctChannel.readBoolean()) {
-                long totalDownloadTraffic = 0;
-                for (TransferConnection connection : connections) {
-                    totalDownloadTraffic += connection.resetTotalTrafficInfo().downloadTraffic;
+            try {
+                ctChannel.writeBoolean(true);
+                if (ctChannel.readBoolean()) {
+                    long totalDownloadTraffic = 0;
+                    for (TransferConnection connection : connections) {
+                        totalDownloadTraffic += connection.resetTotalTrafficInfo().downloadTraffic;
+                    }
+                    long elapsed = Math.max(1L, System.currentTimeMillis() - startTime);
+                    callback.onComplete(false, totalDownloadTraffic, elapsed);
+                } else {
+                    callback.onReadFileError(ctChannel.readUTF());
                 }
-                long elapsed = Math.max(1L, System.currentTimeMillis() - startTime);
-                callback.onComplete(false, totalDownloadTraffic, elapsed);
-            } else {
-                callback.onReadFileError(ctChannel.readUTF());
+                return true;
+            } catch (IOException e) {
+                closeTransferConnectionsQuietly();
+                callback.onIncomplete();
+                return false;
             }
-            return true;
         } finally {
             speedMonitorThread.cancel();
+            this.transferInProgress = false;
             this.activeWriteFileCall = null;
+            this.activeTransferThreads = Collections.emptyList();
+        }
+    }
+
+    private boolean readControlBooleanWithAbortAwareness(AtomicBoolean dataChannelBroken, long postAbortTimeoutMs)
+            throws IOException {
+        DataByteChannel ch = this.ctChannel;
+        if (ch == null || !ch.isOpen()) {
+            throw new IOException("Control channel is closed");
+        }
+        if (!(ch.getOrigin() instanceof SocketChannel)) {
+            return ch.readBoolean();
+        }
+        SocketChannel sc = (SocketChannel) ch.getOrigin();
+        Selector selector = Selector.open();
+        SelectionKey key = null;
+        long abortDeadlineMs = 0L;
+        this.activeTransferControlSelector = selector;
+        try {
+            sc.configureBlocking(false);
+            key = sc.register(selector, SelectionKey.OP_READ);
+            while (ch.isOpen() && sc.isOpen()) {
+                if (Thread.currentThread().isInterrupted()) {
+                    throw new IOException("Interrupted waiting for control channel response");
+                }
+                long waitMs = 150L;
+                if (dataChannelBroken.get()) {
+                    long now = System.currentTimeMillis();
+                    if (abortDeadlineMs == 0L) {
+                        abortDeadlineMs = now + Math.max(200L, postAbortTimeoutMs);
+                    }
+                    long remaining = abortDeadlineMs - now;
+                    if (remaining <= 0L) {
+                        throw new IOException("Control channel response timed out after data rail break");
+                    }
+                    waitMs = Math.min(waitMs, remaining);
+                }
+                selector.select(waitMs);
+                if (key.isValid() && key.isReadable()) {
+                    break;
+                }
+            }
+        } finally {
+            this.activeTransferControlSelector = null;
+            if (key != null) {
+                key.cancel();
+            }
+            try {
+                selector.selectNow();
+            } catch (IOException ignored) {
+            }
+            try {
+                selector.close();
+            } catch (IOException ignored) {
+            }
+            if (sc.isOpen()) {
+                try {
+                    sc.configureBlocking(true);
+                } catch (IOException ignored) {
+                }
+            }
+        }
+        if (!ch.isOpen() || !sc.isOpen()) {
+            throw new IOException("Control channel closed while waiting for transfer ack");
+        }
+        return ch.readBoolean();
+    }
+
+    private static void abortAndJoinTransferTasks(List<FutureTask<Void>> tasks,
+                                                  List<Thread> threads,
+                                                  long timeoutMs) {
+        if (threads != null) {
+            for (Thread t : threads) {
+                if (t != null && t.isAlive()) {
+                    t.interrupt();
+                }
+            }
+        }
+        long deadline = System.currentTimeMillis() + Math.max(100L, timeoutMs);
+        if (tasks != null) {
+            for (FutureTask<Void> task : tasks) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0L) {
+                    break;
+                }
+                try {
+                    task.get(remaining, TimeUnit.MILLISECONDS);
+                } catch (Exception ignored) {
+                }
+            }
         }
     }
 

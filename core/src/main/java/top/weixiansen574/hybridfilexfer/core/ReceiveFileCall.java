@@ -16,14 +16,20 @@ public class ReceiveFileCall implements Callable<Void> {
     private final TransferConnection connection;
     private final String iName;
     private final int blockSize;
+    private final Runnable onConnectionBreak;
 
     public ReceiveFileCall(int tIndex, TransferConnection connection, WriteFileCall writeFileCall,
                            TransferFileCallback callback) {
-        this(tIndex, connection, writeFileCall, callback, FileBlock.DEFAULT_BLOCK_SIZE);
+        this(tIndex, connection, writeFileCall, callback, FileBlock.DEFAULT_BLOCK_SIZE, null);
     }
 
     public ReceiveFileCall(int tIndex, TransferConnection connection, WriteFileCall writeFileCall,
                            TransferFileCallback callback, int blockSize) {
+        this(tIndex, connection, writeFileCall, callback, blockSize, null);
+    }
+
+    public ReceiveFileCall(int tIndex, TransferConnection connection, WriteFileCall writeFileCall,
+                           TransferFileCallback callback, int blockSize, Runnable onConnectionBreak) {
         this.writeFileCall = writeFileCall;
         this.tIndex = tIndex;
         this.connection = connection;
@@ -31,6 +37,7 @@ public class ReceiveFileCall implements Callable<Void> {
         this.callback = callback;
         this.iName = connection.iName;
         this.blockSize = blockSize > 0 ? blockSize : FileBlock.DEFAULT_BLOCK_SIZE;
+        this.onConnectionBreak = onConnectionBreak;
         connection.resetTotalTrafficInfo();
     }
 
@@ -110,7 +117,14 @@ public class ReceiveFileCall implements Callable<Void> {
             if (heldBuffer != null) {
                 writeFileCall.recycleBuffer(heldBuffer);
             }
+            writeFileCall.cancel();
             writeFileCall.finishChannel(tIndex);
+            if (onConnectionBreak != null) {
+                try {
+                    onConnectionBreak.run();
+                } catch (Throwable ignored) {
+                }
+            }
             callback.onChannelError(iName, TransferFileCallback.ERROR_TYPE_EXCEPTION, e.toString());
             throw e;
         }

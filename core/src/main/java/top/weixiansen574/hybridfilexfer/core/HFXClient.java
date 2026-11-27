@@ -373,28 +373,28 @@ public abstract class HFXClient extends HFXService {
 
     /**
      * Initiates a graceful shutdown towards the server, stops the control loop, and releases all resources.
+     * Uses bounded lock acquisition so a stuck transfer on a half-open Wi-Fi socket can never deadlock teardown.
      */
     public void disconnectGracefully() {
         isRun = false;
+        boolean busyTransfer = isTransferInProgress();
         cancelActiveTransfer();
-        if (ctChannel != null && ctChannel.isOpen()) {
-            try {
-                executeWithControlLock(new ControlAction<Void>() {
-                    @Override
-                    public Void run() throws IOException {
-                        try {
-                            ctChannel.writeShort(ControllerIdentifiers.SHUTDOWN);
-                        } catch (IOException ignored) {
-                        }
-                        return null;
+        if (!busyTransfer && ctChannel != null && ctChannel.isOpen()) {
+            tryExecuteWithControlLock(new ControlAction<Void>() {
+                @Override
+                public Void run() throws IOException {
+                    try {
+                        ctChannel.writeShort(ControllerIdentifiers.SHUTDOWN);
+                    } catch (IOException ignored) {
                     }
-                });
-            } catch (IOException ignored) {
-            }
+                    return null;
+                }
+            }, DEFAULT_SHUTDOWN_LOCK_TIMEOUT_MS);
         }
         stopControlLoop();
         closeAllConnections();
         closeQuietly(ctChannel);
+        awaitTransferThreadsQuietly(1000L);
         freeBuffers();
     }
 
@@ -404,6 +404,7 @@ public abstract class HFXClient extends HFXService {
         stopControlLoop();
         closeAllConnections();
         closeQuietly(ctChannel);
+        awaitTransferThreadsQuietly(1000L);
         freeBuffers();
     }
 

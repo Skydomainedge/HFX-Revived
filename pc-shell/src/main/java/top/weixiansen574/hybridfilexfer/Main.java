@@ -252,7 +252,7 @@ public class Main {
                 }
             } else if (sc.current == SessionState.IDLE && sc.prev != SessionState.IDLE
                     && sc.prev != SessionState.CONNECTING && sc.prev != SessionState.PAIRING
-                    && sc.prev != SessionState.DISCOVERING) {
+                    && sc.prev != SessionState.DISCOVERING && sc.prev != SessionState.ERROR) {
                 Strings.printf("client_exit");
             }
         } else if (IpcEvents.TRANSFER_PROGRESS.equals(eventName)

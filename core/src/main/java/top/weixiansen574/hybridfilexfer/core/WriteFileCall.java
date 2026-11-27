@@ -275,6 +275,10 @@ public abstract class WriteFileCall implements Callable<Void> {
         cancel();
     }
 
+    public synchronized boolean isCanceled() {
+        return canceled;
+    }
+
     public synchronized void putBlock(FileBlock block, int tIndex) {
         if (canceled) {
             if (block.data != null) {

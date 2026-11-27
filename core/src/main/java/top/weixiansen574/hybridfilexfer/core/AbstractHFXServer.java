@@ -607,23 +607,22 @@ public abstract class AbstractHFXServer extends HFXService {
         closeQuietly(serverSocketChannel);
     }
 
-    public void sendFilesToRemote(final List<RemoteFile> files, final Directory localDir, final Directory remoteDir,
-                                  final TransferFileCallback callback) throws IOException {
-        executeWithControlLock(new ControlAction<Void>() {
+    public boolean sendFilesToRemote(final List<RemoteFile> files, final Directory localDir, final Directory remoteDir,
+                                     final TransferFileCallback callback) throws IOException {
+        return executeWithControlLock(new ControlAction<Boolean>() {
             @Override
-            public Void run() throws IOException {
+            public Boolean run() throws IOException {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_RECEIVE);
-                sendFiles(files, localDir, remoteDir, callback);
-                return null;
+                return sendFiles(files, localDir, remoteDir, callback);
             }
         });
     }
 
-    public void sendFilesToShelf(final List<RemoteFile> files, final Directory localDir, final Directory remoteDir,
-                                 final TransferFileCallback callback) throws IOException {
-        executeWithControlLock(new ControlAction<Void>() {
+    public boolean sendFilesToShelf(final List<RemoteFile> files, final Directory localDir, final Directory remoteDir,
+                                    final TransferFileCallback callback) throws IOException {
+        return executeWithControlLock(new ControlAction<Boolean>() {
             @Override
-            public Void run() throws IOException {
+            public Boolean run() throws IOException {
                 ctChannel.writeShort(ControllerIdentifiers.REQUEST_SEND);
                 ctChannel.writeInt(files.size());
                 for (RemoteFile file : files) {
@@ -632,8 +631,7 @@ public abstract class AbstractHFXServer extends HFXService {
                 ctChannel.writeUTF(localDir.path);
                 ctChannel.writeInt(localDir.fileSystem);
                 ctChannel.writeUTF(remoteDir.path);
-                receiveFiles(callback);
-                return null;
+                return receiveFiles(callback);
             }
         });
     }
@@ -690,33 +688,36 @@ public abstract class AbstractHFXServer extends HFXService {
     }
 
     public void disconnect() {
+        boolean busyTransfer = isTransferInProgress();
         cancelActiveTransfer();
-        if (ctChannel != null && ctChannel.isOpen()) {
-            try {
-                executeWithControlLock(new ControlAction<Void>() {
-                    @Override
-                    public Void run() throws IOException {
-                        try {
-                            ctChannel.writeShort(ControllerIdentifiers.SHUTDOWN);
-                        } catch (IOException ignored) {
-                        }
-                        return null;
+        if (!busyTransfer && ctChannel != null && ctChannel.isOpen()) {
+            tryExecuteWithControlLock(new ControlAction<Void>() {
+                @Override
+                public Void run() throws IOException {
+                    try {
+                        ctChannel.writeShort(ControllerIdentifiers.SHUTDOWN);
+                    } catch (IOException ignored) {
                     }
-                });
-            } catch (IOException ignored) {
-            }
+                    return null;
+                }
+            }, DEFAULT_SHUTDOWN_LOCK_TIMEOUT_MS);
         }
         stopControlLoop();
-        freeBuffers();
+        closeConnections(connections);
         closeQuietly(ctChannel);
         closeQuietly(serverSocketChannel);
-        closeConnections(connections);
+        awaitTransferThreadsQuietly(1000L);
+        freeBuffers();
     }
 
     public void close() {
+        cancelActiveTransfer();
         stopControlLoop();
-        freeBuffers();
+        closeConnections(connections);
+        closeQuietly(ctChannel);
         closeQuietly(serverSocketChannel);
+        awaitTransferThreadsQuietly(1000L);
+        freeBuffers();
     }
 
     protected abstract ByteBuffer createBuffer(int size);

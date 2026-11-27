@@ -267,6 +267,133 @@ public class AdbManagerTest {
         assertEquals(2, cap.recommendedStreams);
     }
 
+    @Test
+    public void testForwardPortAutoRecoversOfflineDeviceWithoutKillingSharedDaemon() {
+        String adb35 = "C:\\Users\\Dev\\AppData\\Local\\Android\\Sdk\\platform-tools\\adb.exe";
+        FakeEnv env = new FakeEnv(true)
+                .env("LOCALAPPDATA", "C:\\Users\\Dev\\AppData\\Local")
+                .file(adb35);
+
+        List<List<String>> invokedCommands = new ArrayList<>();
+        final boolean[] recovered = new boolean[]{false};
+        final int[] forwardAttempts = new int[]{0};
+
+        AdbManager.CommandExecutor offlineExec = (cmd, envSpec, wd, timeoutMs) -> {
+            invokedCommands.add(new ArrayList<>(cmd));
+            if (cmd.contains("version")) {
+                return new AdbManager.CommandResult(0,
+                        "Android Debug Bridge version 1.0.41\nVersion 35.0.2-12147458\n", "");
+            }
+            if (cmd.contains("host-features")) {
+                return new AdbManager.CommandResult(0, "shell_v2,sendrecv_v2\n", "");
+            }
+            if (cmd.contains("features")) {
+                return recovered[0]
+                        ? new AdbManager.CommandResult(0, "shell_v2,sendrecv_v2\n", "")
+                        : new AdbManager.CommandResult(1, "", "adb.exe: device offline");
+            }
+            if (cmd.contains("reconnect") && cmd.contains("offline")) {
+                recovered[0] = true;
+                return new AdbManager.CommandResult(0, "reconnecting 3B15B100P8E00000\n", "");
+            }
+            if (cmd.contains("devices")) {
+                String state = recovered[0] ? "device" : "offline";
+                return new AdbManager.CommandResult(0,
+                        "List of devices attached\n3B15B100P8E00000\t" + state + "\n", "");
+            }
+            if (cmd.contains("forward") && cmd.contains("--remove")) {
+                return new AdbManager.CommandResult(0, "", "");
+            }
+            if (cmd.contains("forward")) {
+                forwardAttempts[0]++;
+                if (!recovered[0]) {
+                    return new AdbManager.CommandResult(1, "", "adb.exe: device offline");
+                }
+                return new AdbManager.CommandResult(0, "5740\n", "");
+            }
+            return new AdbManager.CommandResult(0, "", "");
+        };
+
+        List<String> eventCodes = new ArrayList<>();
+        AdbManager.AdbConfig cfg = new AdbManager.AdbConfig();
+        cfg.offlinePollIntervalMs = 10L;
+        cfg.offlineRecoveryWaitMs = 1000L;
+
+        AdbManager mgr = new AdbManager(cfg, offlineExec, env, (ev, payload) -> {
+            if (payload instanceof IpcPayloads.DiagnosticWarningPayload) {
+                eventCodes.add(((IpcPayloads.DiagnosticWarningPayload) payload).code);
+            }
+        });
+
+        AdbManager.ForwardResult result = mgr.forwardPort(5740, 5740, "3B15B100P8E00000");
+        assertTrue("forwardPort must auto-recover after adb reconnect offline", result.success);
+        assertEquals(2, forwardAttempts[0]);
+        assertEquals(1, mgr.getActiveForwardCount());
+        assertTrue("Expected ADB_OFFLINE_RECOVERY diagnostic event",
+                eventCodes.contains("ADB_OFFLINE_RECOVERY"));
+        assertTrue("Must invoke 'adb reconnect offline'",
+                invokedCommands.stream().anyMatch(c -> c.contains("reconnect") && c.contains("offline")));
+        assertFalse("Must NEVER invoke destructive 'adb kill-server' on shared daemon",
+                invokedCommands.stream().anyMatch(c -> c.contains("kill-server")));
+    }
+
+    @Test
+    public void testCleanupForwardsUsesBoundedTimeoutAndTriggersOfflineRecoveryOnWedgedTransport() {
+        String adb35 = "C:\\Tools\\adb35\\adb.exe";
+        FakeEnv env = new FakeEnv(true).env("PATH", "C:\\Tools\\adb35").file(adb35);
+
+        List<List<String>> cmds = new ArrayList<>();
+        List<Long> removeTimeouts = new ArrayList<>();
+
+        AdbManager.CommandExecutor exec = (cmd, envSpec, wd, timeoutMs) -> {
+            cmds.add(new ArrayList<>(cmd));
+            if (cmd.contains("version")) {
+                return new AdbManager.CommandResult(0, "Version 35.0.2-12147458\n", "");
+            }
+            if (cmd.contains("host-features") || cmd.contains("features")) {
+                return new AdbManager.CommandResult(0, "shell_v2\n", "");
+            }
+            if (cmd.contains("forward") && cmd.contains("--remove")) {
+                removeTimeouts.add(timeoutMs);
+                return new AdbManager.CommandResult(1, "", "adb.exe: device offline");
+            }
+            if (cmd.contains("forward")) {
+                return new AdbManager.CommandResult(0, "5740\n", "");
+            }
+            return new AdbManager.CommandResult(0, "", "");
+        };
+
+        AdbManager.AdbConfig cfg = new AdbManager.AdbConfig();
+        cfg.commandTimeoutMs = 10_000L;
+        cfg.cleanupTimeoutMs = 1_500L;
+
+        AdbManager mgr = new AdbManager(cfg, exec, env, null);
+        assertTrue(mgr.forwardPort(5740, 5740, "DEV999").success);
+        assertEquals(1, mgr.getActiveForwardCount());
+
+        mgr.close();
+        assertEquals(0, mgr.getActiveForwardCount());
+        assertEquals(1, removeTimeouts.size());
+        assertEquals(Long.valueOf(1_500L), removeTimeouts.get(0));
+        assertTrue("Teardown must issue best-effort 'adb reconnect offline' when remove sees offline",
+                cmds.stream().anyMatch(c -> c.contains("reconnect") && c.contains("offline")));
+    }
+
+    @Test
+    public void testParseDevicesOutputHandlesStatesAndDaemonNoise() {
+        String raw = "* daemon not running; starting now at tcp:5037\n"
+                + "* daemon started successfully\n"
+                + "List of devices attached\n"
+                + "3B15B100P8E00000       offline transport_id:137\n"
+                + "emulator-5554          device product:sdk_gphone64_x86_64\n"
+                + "UNAUTH01               unauthorized\n";
+        Map<String, String> parsed = AdbManager.parseDevicesOutput(raw);
+        assertEquals(3, parsed.size());
+        assertEquals("offline", parsed.get("3B15B100P8E00000"));
+        assertEquals("device", parsed.get("emulator-5554"));
+        assertEquals("unauthorized", parsed.get("UNAUTH01"));
+    }
+
     // ---- Test doubles ----
 
     private static final class FakeEnv implements AdbManager.EnvironmentProvider {

@@ -23,14 +23,21 @@ public class SendFileCall implements Callable<Void> {
     private final DataByteChannel channel;
     private final TransferConnection connection;
     private final TransferFileCallback callback;
+    private final Runnable onConnectionBreak;
     private ByteBuffer headerBuf = ByteBuffer.allocate(INITIAL_HEADER_CAPACITY);
     private final ByteBuffer[] gatheringBuffers = new ByteBuffer[2];
 
     public SendFileCall(ReadFileCall readFileCall, TransferConnection connection, TransferFileCallback callback) {
+        this(readFileCall, connection, callback, null);
+    }
+
+    public SendFileCall(ReadFileCall readFileCall, TransferConnection connection,
+                        TransferFileCallback callback, Runnable onConnectionBreak) {
         this.readFileCall = readFileCall;
         this.connection = connection;
         this.channel = connection.channel;
         this.callback = callback;
+        this.onConnectionBreak = onConnectionBreak;
         connection.resetTotalTrafficInfo();
     }
 
@@ -121,10 +128,16 @@ public class SendFileCall implements Callable<Void> {
                 connection.addUploadedBytes(payloadLength);
             }
         } catch (Exception e) {
+            readFileCall.shutdownByConnectionBreak();
             if (heldBuffer != null) {
                 readFileCall.recycleBuffer(heldBuffer);
             }
-            readFileCall.shutdownByConnectionBreak();
+            if (onConnectionBreak != null) {
+                try {
+                    onConnectionBreak.run();
+                } catch (Throwable ignored) {
+                }
+            }
             callback.onChannelError(connection.iName, TransferFileCallback.ERROR_TYPE_EXCEPTION, e.toString());
             throw e;
         }

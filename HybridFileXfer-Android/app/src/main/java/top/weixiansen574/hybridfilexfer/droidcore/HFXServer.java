@@ -148,10 +148,10 @@ public class HFXServer extends AbstractHFXServer {
 
     @Override
     protected void freeBuffers() {
-        for (ByteBuffer buffer : buffers) {
+        ByteBuffer buffer;
+        while ((buffer = buffers.poll()) != null) {
             NativeMemory.freeBuffer(buffer);
         }
-        buffers.clear();
     }
 
     @Override

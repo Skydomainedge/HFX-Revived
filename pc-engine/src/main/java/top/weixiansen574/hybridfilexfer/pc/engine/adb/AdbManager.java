@@ -49,6 +49,9 @@ public class AdbManager implements AutoCloseable {
     public static final int DEFAULT_MODERN_STREAMS = 2;
     public static final int DEFAULT_FALLBACK_STREAMS = 4;
     public static final long DEFAULT_COMMAND_TIMEOUT_MS = 10_000L;
+    public static final long DEFAULT_CLEANUP_TIMEOUT_MS = 2_000L;
+    public static final long DEFAULT_OFFLINE_RECOVERY_WAIT_MS = 4_000L;
+    public static final long DEFAULT_OFFLINE_POLL_INTERVAL_MS = 250L;
 
     private static final Pattern VERSION_LINE_PATTERN =
             Pattern.compile("(?im)^\\s*Version\\s+(\\d+)\\.(\\d+)\\.(\\d+)(?:-(\\d+))?");
@@ -70,6 +73,10 @@ public class AdbManager implements AutoCloseable {
         public int fallbackRecommendedStreams = DEFAULT_FALLBACK_STREAMS;
         public Integer overrideStreams;
         public long commandTimeoutMs = DEFAULT_COMMAND_TIMEOUT_MS;
+        public long cleanupTimeoutMs = DEFAULT_CLEANUP_TIMEOUT_MS;
+        public boolean autoRecoverOfflineDevice = true;
+        public long offlineRecoveryWaitMs = DEFAULT_OFFLINE_RECOVERY_WAIT_MS;
+        public long offlinePollIntervalMs = DEFAULT_OFFLINE_POLL_INTERVAL_MS;
         public File workingDirectory = new File(System.getProperty("user.dir", "."));
         public final List<String> extraSearchPaths = new ArrayList<>();
 
@@ -88,6 +95,12 @@ public class AdbManager implements AutoCloseable {
             c.fallbackRecommendedStreams = this.fallbackRecommendedStreams;
             c.overrideStreams = this.overrideStreams;
             c.commandTimeoutMs = this.commandTimeoutMs > 0 ? this.commandTimeoutMs : DEFAULT_COMMAND_TIMEOUT_MS;
+            c.cleanupTimeoutMs = this.cleanupTimeoutMs > 0 ? this.cleanupTimeoutMs : DEFAULT_CLEANUP_TIMEOUT_MS;
+            c.autoRecoverOfflineDevice = this.autoRecoverOfflineDevice;
+            c.offlineRecoveryWaitMs = this.offlineRecoveryWaitMs >= 0
+                    ? this.offlineRecoveryWaitMs : DEFAULT_OFFLINE_RECOVERY_WAIT_MS;
+            c.offlinePollIntervalMs = this.offlinePollIntervalMs >= 0
+                    ? this.offlinePollIntervalMs : DEFAULT_OFFLINE_POLL_INTERVAL_MS;
             c.workingDirectory = this.workingDirectory != null
                     ? this.workingDirectory
                     : new File(System.getProperty("user.dir", "."));
@@ -586,7 +599,63 @@ public class AdbManager implements AutoCloseable {
     }
 
     /**
+     * Parses {@code adb devices} output into an ordered {@code serial -> state} map
+     * (e.g. {@code "device"}, {@code "offline"}, {@code "unauthorized"}).
+     */
+    public static Map<String, String> parseDevicesOutput(String output) {
+        Map<String, String> devices = new LinkedHashMap<>();
+        if (output == null || output.isEmpty()) {
+            return devices;
+        }
+        String[] lines = output.split("\\r?\\n");
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            String lower = trimmed.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("list of devices") || lower.startsWith("*")
+                    || lower.startsWith("adb:") || lower.startsWith("adb.exe:")
+                    || lower.startsWith("error:")) {
+                continue;
+            }
+            String[] parts = trimmed.split("\\s+");
+            if (parts.length >= 2 && !parts[0].isEmpty() && !parts[1].isEmpty()) {
+                devices.put(parts[0], parts[1].toLowerCase(Locale.ROOT));
+            }
+        }
+        return devices;
+    }
+
+    static boolean isOfflineError(CommandResult res) {
+        if (res == null || res.isSuccess()) {
+            return false;
+        }
+        String combined = (res.stderr + "\n" + res.stdout).toLowerCase(Locale.ROOT);
+        return combined.contains("device offline") || combined.contains("offline");
+    }
+
+    static boolean isRecoverableTransportError(CommandResult res) {
+        if (res == null || res.isSuccess()) {
+            return false;
+        }
+        if (isOfflineError(res)) {
+            return true;
+        }
+        String combined = (res.stderr + "\n" + res.stdout).toLowerCase(Locale.ROOT);
+        return combined.contains("protocol fault")
+                || combined.contains("closed")
+                || combined.contains("timed out")
+                || combined.contains("not found");
+    }
+
+    /**
      * Establishes {@code adb [-s serial] forward tcp:<localPort> tcp:<remotePort>} with process-level env.
+     *
+     * <p>If the USB transport is stuck in Windows WinUSB {@code offline} loop after an abnormal
+     * disconnect/Wi-Fi drop, performs targeted non-destructive recovery ({@code adb reconnect offline})
+     * without killing the shared {@code adb} daemon, waits briefly for the device to return online,
+     * refreshes device features, and retries {@code forward} once.</p>
      */
     public ForwardResult forwardPort(int localPort, int remotePort, String serial) {
         IpcDtos.AdbCapabilityInfo cap = probe(serial);
@@ -595,6 +664,7 @@ public class AdbManager implements AutoCloseable {
                     cap.warning != null ? cap.warning : "adb not available", cap);
         }
 
+        ProcessEnvSpec envSpec = buildProcessEnvironment();
         List<String> cmd = buildBaseCommand(cap.adbPath, serial);
         cmd.add("forward");
         cmd.add("tcp:" + localPort);
@@ -602,7 +672,24 @@ public class AdbManager implements AutoCloseable {
 
         try {
             CommandResult res = commandExecutor.execute(
-                    cmd, buildProcessEnvironment(), config.workingDirectory, config.commandTimeoutMs);
+                    cmd, envSpec, config.workingDirectory, config.commandTimeoutMs);
+
+            if (!res.isSuccess() && config.autoRecoverOfflineDevice && isRecoverableTransportError(res)) {
+                boolean offlineDetected = isOfflineError(res);
+                if (!offlineDetected) {
+                    Map<String, String> devices = listDevices(cap.adbPath, envSpec,
+                            Math.min(config.commandTimeoutMs, config.cleanupTimeoutMs));
+                    offlineDetected = hasOfflineDevice(devices, serial);
+                }
+                if (offlineDetected && recoverOfflineTransport(cap.adbPath, serial, envSpec, true)) {
+                    // Clear any stale forward rule left by an interrupted session before re-forwarding
+                    executeRemoveForward(cap.adbPath, localPort, serial, config.cleanupTimeoutMs);
+                    refreshDeviceFeaturesAfterRecovery(cap, serial, envSpec);
+                    res = commandExecutor.execute(
+                            cmd, envSpec, config.workingDirectory, config.commandTimeoutMs);
+                }
+            }
+
             if (res.isSuccess()) {
                 activeForwards.add(new ForwardRule(cap.adbPath, localPort, serial));
             }
@@ -644,17 +731,29 @@ public class AdbManager implements AutoCloseable {
         if (adbPath == null) {
             return false;
         }
-        return executeRemoveForward(adbPath, localPort, normalizedSerial);
+        CommandResult res = executeRemoveForward(adbPath, localPort, normalizedSerial, config.cleanupTimeoutMs);
+        return res != null && res.isSuccess();
     }
 
     /**
-     * Cleans up all active port forwards created by this manager.
+     * Cleans up all active port forwards created by this manager using a bounded timeout budget.
+     * If removal observes a wedged {@code device offline} USB transport, issues a single bounded
+     * non-destructive {@code adb reconnect offline} so the next session can connect immediately.
      */
     public void cleanupForwards() {
         List<ForwardRule> snapshot = new ArrayList<>(activeForwards);
         activeForwards.clear();
+        String offlineAdbPath = null;
+        String offlineSerial = null;
         for (ForwardRule rule : snapshot) {
-            executeRemoveForward(rule.adbPath, rule.localPort, rule.serial);
+            CommandResult res = executeRemoveForward(rule.adbPath, rule.localPort, rule.serial, config.cleanupTimeoutMs);
+            if (isOfflineError(res)) {
+                offlineAdbPath = rule.adbPath;
+                offlineSerial = rule.serial;
+            }
+        }
+        if (offlineAdbPath != null && config.autoRecoverOfflineDevice) {
+            recoverOfflineTransport(offlineAdbPath, offlineSerial, buildProcessEnvironment(), false);
         }
     }
 
@@ -696,21 +795,152 @@ public class AdbManager implements AutoCloseable {
         unregisterShutdownHook();
     }
 
-    private boolean executeRemoveForward(String adbPath, int localPort, String serial) {
+    private CommandResult executeRemoveForward(String adbPath, int localPort, String serial, long timeoutMs) {
         List<String> cmd = buildBaseCommand(adbPath, serial);
         cmd.add("forward");
         cmd.add("--remove");
         cmd.add("tcp:" + localPort);
         try {
-            CommandResult res = commandExecutor.execute(
-                    cmd, buildProcessEnvironment(), config.workingDirectory, config.commandTimeoutMs);
-            return res.isSuccess();
+            return commandExecutor.execute(
+                    cmd, buildProcessEnvironment(), config.workingDirectory, timeoutMs);
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return new CommandResult(-1, "", e.getMessage());
+        }
+    }
+
+    private Map<String, String> listDevices(String adbPath, ProcessEnvSpec envSpec, long timeoutMs) {
+        List<String> cmd = new ArrayList<>(2);
+        cmd.add(adbPath);
+        cmd.add("devices");
+        try {
+            CommandResult res = commandExecutor.execute(cmd, envSpec, config.workingDirectory, timeoutMs);
+            if (!res.isSuccess()) {
+                return Collections.emptyMap();
+            }
+            return parseDevicesOutput(res.stdout);
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return Collections.emptyMap();
+        }
+    }
+
+    private static boolean hasOfflineDevice(Map<String, String> devices, String serial) {
+        if (devices == null || devices.isEmpty()) {
+            return false;
+        }
+        if (serial != null && !serial.isEmpty()) {
+            return "offline".equals(devices.get(serial));
+        }
+        for (String st : devices.values()) {
+            if ("offline".equals(st)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean hasOnlineTarget(Map<String, String> devices, String serial) {
+        if (devices == null || devices.isEmpty()) {
+            return false;
+        }
+        if (serial != null && !serial.isEmpty()) {
+            return "device".equals(devices.get(serial));
+        }
+        for (String st : devices.values()) {
+            if ("device".equals(st)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean recoverOfflineTransport(String adbPath, String serial, ProcessEnvSpec envSpec, boolean waitForOnline) {
+        emitDiagnostic("ADB_OFFLINE_RECOVERY",
+                "Detected offline/stalled ADB USB transport"
+                        + (serial != null && !serial.isEmpty() ? " (" + serial + ")" : "")
+                        + "; issuing targeted 'adb reconnect offline' without restarting shared adb daemon.");
+
+        long cmdTimeout = waitForOnline
+                ? Math.min(config.commandTimeoutMs, 4_000L)
+                : Math.min(config.cleanupTimeoutMs, 2_000L);
+        List<String> reconnectOffline = new ArrayList<>(3);
+        reconnectOffline.add(adbPath);
+        reconnectOffline.add("reconnect");
+        reconnectOffline.add("offline");
+        try {
+            commandExecutor.execute(reconnectOffline, envSpec, config.workingDirectory, cmdTimeout);
         } catch (IOException | InterruptedException e) {
             if (e instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
             }
             return false;
         }
+
+        if (!waitForOnline) {
+            return false;
+        }
+        if (awaitDeviceOnline(adbPath, serial, envSpec, config.offlineRecoveryWaitMs)) {
+            return true;
+        }
+
+        if (serial != null && !serial.isEmpty()) {
+            List<String> targetedReconnect = buildBaseCommand(adbPath, serial);
+            targetedReconnect.add("reconnect");
+            try {
+                commandExecutor.execute(targetedReconnect, envSpec, config.workingDirectory, cmdTimeout);
+            } catch (IOException | InterruptedException e) {
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
+                return false;
+            }
+            return awaitDeviceOnline(adbPath, serial, envSpec, Math.min(2_000L, config.offlineRecoveryWaitMs));
+        }
+        return false;
+    }
+
+    private boolean awaitDeviceOnline(String adbPath, String serial, ProcessEnvSpec envSpec, long waitBudgetMs) {
+        long deadline = System.currentTimeMillis() + Math.max(0L, waitBudgetMs);
+        long queryTimeout = Math.min(config.commandTimeoutMs, 2_000L);
+        while (true) {
+            Map<String, String> devices = listDevices(adbPath, envSpec, queryTimeout);
+            if (hasOnlineTarget(devices, serial)) {
+                return true;
+            }
+            long remaining = deadline - System.currentTimeMillis();
+            if (remaining <= 0L) {
+                return false;
+            }
+            long sleepMs = Math.min(config.offlinePollIntervalMs, remaining);
+            if (sleepMs > 0L) {
+                try {
+                    Thread.sleep(sleepMs);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return false;
+                }
+            }
+        }
+    }
+
+    private void refreshDeviceFeaturesAfterRecovery(IpcDtos.AdbCapabilityInfo cap, String serial, ProcessEnvSpec envSpec) {
+        if (cap == null || cap.adbPath == null) {
+            return;
+        }
+        Set<String> hostFeatures = queryFeatures(cap.adbPath, null, "host-features", envSpec);
+        Set<String> deviceFeatures = queryFeatures(cap.adbPath, serial, "features", envSpec);
+        boolean hostHasLibusb = hostFeatures.contains("libusb");
+        boolean hostHasDelayedAck = hostFeatures.contains("delayed_ack");
+        boolean deviceChecked = !deviceFeatures.isEmpty();
+        cap.hasLibusb = hostHasLibusb;
+        cap.hasDelayedAck = hostHasDelayedAck && (!deviceChecked || deviceFeatures.contains("delayed_ack"));
+        cap.recommendedStreams = computeRecommendedStreams(cap.hasLibusb, cap.hasDelayedAck);
+        this.lastCapability = cap;
     }
 
     private Set<String> queryFeatures(String adbPath, String serial, String subcommand, ProcessEnvSpec envSpec) {
@@ -768,6 +998,14 @@ public class AdbManager implements AutoCloseable {
         }
     }
 
+    private void emitDiagnostic(String code, String message) {
+        DiagnosticListener listener = this.diagnosticListener;
+        if (listener != null) {
+            listener.onEvent(IpcEvents.DIAGNOSTIC_WARNING,
+                    new IpcPayloads.DiagnosticWarningPayload(code, message));
+        }
+    }
+
     private static List<String> buildBaseCommand(String adbPath, String serial) {
         List<String> cmd = new ArrayList<>(6);
         cmd.add(adbPath);
@@ -807,6 +1045,10 @@ public class AdbManager implements AutoCloseable {
                 env.putAll(envSpec.setVars);
             }
             Process process = pb.start();
+            try {
+                process.getOutputStream().close();
+            } catch (IOException ignored) {
+            }
             StreamCollector outCollector = new StreamCollector(process.getInputStream());
             StreamCollector errCollector = new StreamCollector(process.getErrorStream());
             Thread outThread = new Thread(outCollector, "hfx-adb-stdout");
@@ -819,15 +1061,40 @@ public class AdbManager implements AutoCloseable {
             long effectiveTimeout = timeoutMs > 0 ? timeoutMs : DEFAULT_COMMAND_TIMEOUT_MS;
             boolean finished = process.waitFor(effectiveTimeout, TimeUnit.MILLISECONDS);
             if (!finished) {
+                // Only terminate the hung client adb invocation; never kill descendants so a shared
+                // adb server daemon used by other tools (e.g. Android Studio) is not collaterally killed.
                 process.destroyForcibly();
-                outThread.join(500);
-                errThread.join(500);
+                closeProcessStreamsQuietly(process);
+                outThread.interrupt();
+                errThread.interrupt();
+                outThread.join(300);
+                errThread.join(300);
                 return new CommandResult(-1, outCollector.getText(),
                         errCollector.getText() + "\nADB command timed out after " + effectiveTimeout + " ms");
             }
-            outThread.join(1000);
-            errThread.join(1000);
+            outThread.join(300);
+            errThread.join(300);
+            // Guard against Windows handle inheritance when adb spawns a detached background daemon
+            // that keeps stdout/stderr pipe ends open after the short-lived adb client exits.
+            if (outThread.isAlive() || errThread.isAlive()) {
+                closeProcessStreamsQuietly(process);
+                outThread.interrupt();
+                errThread.interrupt();
+                outThread.join(200);
+                errThread.join(200);
+            }
             return new CommandResult(process.exitValue(), outCollector.getText(), errCollector.getText());
+        }
+
+        private static void closeProcessStreamsQuietly(Process process) {
+            try {
+                process.getInputStream().close();
+            } catch (IOException ignored) {
+            }
+            try {
+                process.getErrorStream().close();
+            } catch (IOException ignored) {
+            }
         }
     }
 
