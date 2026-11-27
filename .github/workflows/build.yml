@@ -7,26 +7,39 @@ on:
       - '**'
     tags:
       - '**'
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.txt'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE.txt'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
-  build:
+  build-linux:
+    name: 'Monorepo Build & Test (Ubuntu)'
     runs-on: ubuntu-latest
     steps:
       - name: 'Checkout'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: 'Setup Java'
-        uses: actions/setup-java@v4
+      - name: 'Setup Java 21'
+        uses: actions/setup-java@v6
         with:
           distribution: 'temurin'
           java-version: 21
 
       - name: 'Setup Gradle'
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: 'basic'
 
       - name: 'Setup Android SDK'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: 'platform-tools cmake;3.22.1 ndk;26.1.10909125'
 
@@ -37,14 +50,57 @@ jobs:
 
       - name: 'Upload PC Engine JAR'
         if: '${{ success() }}'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: 'hfx-engine-jar'
           path: 'pc-engine/build/libs/hfx-engine-*.jar'
 
       - name: 'Upload Debug APK'
         if: '${{ success() }}'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: 'debug-apk'
           path: 'HybridFileXfer-Android/app/build/outputs/apk/debug/*.apk'
+
+  build-windows:
+    name: 'Windows Engine & Win11 Launcher Verify'
+    runs-on: windows-latest
+    steps:
+      - name: 'Checkout'
+        uses: actions/checkout@v7
+
+      - name: 'Setup Java 21'
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: 21
+
+      - name: 'Setup Gradle'
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: 'basic'
+
+      - name: 'Setup .NET 8'
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: 'Test Core, PC Engine & PC Shell on Windows'
+        run: .\gradlew.bat :core:test :pc-engine:test :pc-engine:shadowJar :pc-shell:test :pc-shell:shadowJar --no-daemon
+
+      - name: 'Build & Self-Verify Win11 Launcher (Toast XML + Job Object)'
+        shell: pwsh
+        run: |
+          dotnet build HybridFileXferLauncher\HybridFileXferLauncher.csproj -c Release
+          $exe = ".\HybridFileXferLauncher\bin\Release\net8.0-windows10.0.19041.0\HybridFileXferLauncher.exe"
+          & $exe --verify-toast-xml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $exe --verify-job-object
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: 'Upload Win11 Launcher Artifact'
+        if: '${{ success() }}'
+        uses: actions/upload-artifact@v7
+        with:
+          name: 'win11-launcher-release'
+          path: 'HybridFileXferLauncher/bin/Release/net8.0-windows10.0.19041.0/**'

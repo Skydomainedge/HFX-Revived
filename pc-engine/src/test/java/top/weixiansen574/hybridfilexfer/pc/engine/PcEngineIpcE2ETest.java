@@ -17,14 +17,13 @@ import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
-import java.io.PipedInputStream;
-import java.io.PipedOutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
+import java.nio.channels.Pipe;
 import java.nio.channels.SocketChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -126,6 +125,7 @@ public class PcEngineIpcE2ETest {
         private final AtomicInteger idGen = new AtomicInteger(1);
         private final Thread readerThread;
         private volatile boolean closed = false;
+        private volatile IOException readError;
 
         NdjsonRpcClient(InputStream in, OutputStream out) {
             this.rawIn = in;
@@ -167,8 +167,15 @@ public class PcEngineIpcE2ETest {
                         notifQueue.add(n);
                     }
                 }
-            } catch (IOException ignored) {
+            } catch (IOException e) {
+                if (!closed) {
+                    readError = e;
+                }
             }
+        }
+
+        IOException getReadError() {
+            return readError;
         }
 
         JsonRpcResponse call(String method, Object paramsObj, String token) throws Exception {
@@ -297,10 +304,15 @@ public class PcEngineIpcE2ETest {
              PcEngineRuntime runtime = new PcEngineRuntime()) {
 
             JsonRpcDispatcher dispatcher = new JsonRpcDispatcher(runtime, null);
-            PipedOutputStream clientToServerOut = new PipedOutputStream();
-            PipedInputStream serverReadIn = new PipedInputStream(clientToServerOut, 65536);
-            PipedOutputStream serverWriteOut = new PipedOutputStream();
-            PipedInputStream clientFromServerIn = new PipedInputStream(serverWriteOut, 65536);
+            // Use OS-backed NIO Pipe instead of java.io.PipedInputStream/PipedOutputStream:
+            // PipedInputStream binds to the last writer thread and throws "Write end dead"
+            // when short-lived transfer/SpeedMonitor worker threads emit transfer.progress and exit.
+            Pipe clientToServerPipe = Pipe.open();
+            Pipe serverToClientPipe = Pipe.open();
+            OutputStream clientToServerOut = Channels.newOutputStream(clientToServerPipe.sink());
+            InputStream serverReadIn = Channels.newInputStream(clientToServerPipe.source());
+            OutputStream serverWriteOut = Channels.newOutputStream(serverToClientPipe.sink());
+            InputStream clientFromServerIn = Channels.newInputStream(serverToClientPipe.source());
 
             StdioIpcTransport transport = new StdioIpcTransport(dispatcher, serverReadIn, serverWriteOut);
             runtime.setShutdownHandler(transport::close);
@@ -318,6 +330,10 @@ public class PcEngineIpcE2ETest {
             } finally {
                 try {
                     serverWriteOut.close();
+                } catch (IOException ignored) {
+                }
+                try {
+                    serverReadIn.close();
                 } catch (IOException ignored) {
                 }
                 transportFuture.get(5, TimeUnit.SECONDS);
@@ -556,7 +572,7 @@ public class PcEngineIpcE2ETest {
         assertTrue("upload transfer.start must succeed", upResp.isSuccess());
 
         JsonRpcNotification upDone = client.awaitNotification(IpcEvents.TRANSFER_COMPLETED, 15);
-        assertNotNull("Expected transfer.completed for upload", upDone);
+        assertNotNull("Expected transfer.completed for upload (readError=" + client.getReadError() + ")", upDone);
         IpcPayloads.TransferCompletedPayload upDonePayload = IpcJson.fromJson(
                 upDone.params, IpcPayloads.TransferCompletedPayload.class);
         assertEquals("upload", upDonePayload.direction);
@@ -581,7 +597,7 @@ public class PcEngineIpcE2ETest {
         assertTrue("download transfer.start must succeed", dnResp.isSuccess());
 
         JsonRpcNotification dnDone = client.awaitNotification(IpcEvents.TRANSFER_COMPLETED, 15);
-        assertNotNull("Expected transfer.completed for download", dnDone);
+        assertNotNull("Expected transfer.completed for download (readError=" + client.getReadError() + ")", dnDone);
         IpcPayloads.TransferCompletedPayload dnDonePayload = IpcJson.fromJson(
                 dnDone.params, IpcPayloads.TransferCompletedPayload.class);
         assertEquals("download", dnDonePayload.direction);

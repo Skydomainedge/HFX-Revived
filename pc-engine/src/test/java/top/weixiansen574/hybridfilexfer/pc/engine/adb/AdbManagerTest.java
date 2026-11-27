@@ -228,6 +228,45 @@ public class AdbManagerTest {
         assertEquals("1_1", result.stdout.trim());
     }
 
+    @Test
+    public void testPosixDiscoveryAcrossAndroidHomePathAndWorkingDir() {
+        String sdkPath = "/opt/android-sdk/platform-tools/adb";
+        String pathModern = "/usr/local/bin/adb";
+        String cwdLegacy = "/home/dev/work/adb";
+
+        FakeEnv env = new FakeEnv(false)
+                .env("ANDROID_HOME", "/opt/android-sdk")
+                .env("PATH", "/usr/bin:/usr/local/bin")
+                .file(sdkPath)
+                .file(pathModern)
+                .file(cwdLegacy);
+
+        Map<String, String> versions = new HashMap<>();
+        versions.put(sdkPath, "Android Debug Bridge version 1.0.41\nVersion 35.0.2-12147458");
+        versions.put(pathModern, "Android Debug Bridge version 1.0.41\nVersion 36.0.0-13206524");
+        versions.put(cwdLegacy, "Android Debug Bridge version 1.0.41\nVersion 34.0.5-10900879");
+
+        RecordingExecutor exec = new RecordingExecutor(versions,
+                "shell_v2,delayed_ack,libusb",
+                "shell_v2,delayed_ack");
+
+        AdbManager.AdbConfig cfg = new AdbManager.AdbConfig();
+        cfg.workingDirectory = new File("/home/dev/work");
+
+        AdbManager manager = new AdbManager(cfg, exec, env, null);
+        List<AdbManager.AdbCandidate> ranked = manager.discoverCandidates();
+
+        assertEquals(3, ranked.size());
+        assertEquals(pathModern, ranked.get(0).path);
+        assertEquals(sdkPath, ranked.get(1).path);
+        assertEquals(cwdLegacy, ranked.get(2).path);
+
+        IpcDtos.AdbCapabilityInfo cap = manager.probe("POSIXDEV");
+        assertTrue(cap.available);
+        assertEquals(pathModern, cap.adbPath);
+        assertEquals(2, cap.recommendedStreams);
+    }
+
     // ---- Test doubles ----
 
     private static final class FakeEnv implements AdbManager.EnvironmentProvider {
@@ -276,7 +315,8 @@ public class AdbManagerTest {
 
         @Override
         public String canonicalizePath(File file) {
-            return file.getPath();
+            char targetSep = windows ? '\\' : '/';
+            return file.getPath().replace('/', targetSep).replace('\\', targetSep);
         }
     }
 
@@ -291,15 +331,21 @@ public class AdbManagerTest {
     }
 
     private static final class RecordingExecutor implements AdbManager.CommandExecutor {
-        private final Map<String, String> versionByLowerPath;
+        private final Map<String, String> versionByNormalizedPath = new HashMap<>();
         private final String hostFeaturesOut;
         private final String deviceFeaturesOut;
         final List<RecordedCall> calls = new ArrayList<>();
 
         RecordingExecutor(Map<String, String> versionByLowerPath, String hostFeaturesOut, String deviceFeaturesOut) {
-            this.versionByLowerPath = versionByLowerPath;
+            for (Map.Entry<String, String> entry : versionByLowerPath.entrySet()) {
+                this.versionByNormalizedPath.put(normalizeLookupKey(entry.getKey()), entry.getValue());
+            }
             this.hostFeaturesOut = hostFeaturesOut;
             this.deviceFeaturesOut = deviceFeaturesOut;
+        }
+
+        private static String normalizeLookupKey(String path) {
+            return path.replace('\\', '/').toLowerCase(Locale.ROOT);
         }
 
         RecordedCall findCallContaining(String token) {
@@ -317,9 +363,9 @@ public class AdbManagerTest {
                                                 File workingDir,
                                                 long timeoutMs) {
             calls.add(new RecordedCall(command, envSpec));
-            String bin = command.get(0).toLowerCase(Locale.ROOT);
+            String bin = normalizeLookupKey(command.get(0));
             if (command.contains("version")) {
-                String out = versionByLowerPath.get(bin);
+                String out = versionByNormalizedPath.get(bin);
                 if (out == null) {
                     return new AdbManager.CommandResult(1, "", "not found");
                 }
