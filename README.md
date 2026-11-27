@@ -182,12 +182,23 @@ dotnet build HybridFileXferLauncher\HybridFileXferLauncher.csproj -c Release
 - [x] **M2**：PC `AdbManager`（高版择优 / 异步突发 / 4 流兜底）+ 同网段源 IP `bind` + Android `UsbNicAdvisor` 同线互斥
 - [x] **M3**：双端无头业务内核与展示层 IPC 彻底剥离、PC 默认盘符首屏、快捷测试脚本与 SHA-256 校验器
 - [x] **M4**：多网卡 `JmDNS` 零配置发现、纯 Java 480×480 PNG QR、Win11 原生 Toast 宿主、防火墙 `pair_ack` 反向兜底与离线扫码框
-- [ ] **下一阶段探索（v4.5 / v5 调研中）**：
-  - 5 Gbps / 10 Gbps 有线网卡环境与 Wi-Fi 6E 双流 / Wi-Fi 7 MLO 多频聚合极限压榨；
-  - USB 3.2 Gen 2 / CDC-NCM NTB 深度调优与可选 Root/KernelSU 网卡 RPS/IRQ 绑核及流控调度；
-  - Chunk 级分片记忆、掉线断点续传与原地整片整合；
-  - 海量小文件动态归并打包流管线与异构快慢轨工作窃取（Work-Stealing）调度算法；
-  - 现代化跨端 UI 壳演进（含独立成行快捷路径跳转标签栏等体验升级）。
+- [x] **v4.0.0-alpha.1（P0 生命周期热修）**：mDNS 并行有界超时关闭、Win32 Job Object（`KILL_ON_JOB_CLOSE`）进程树托管与子进程退出 JAR 零文件锁回归守护
+- [ ] **下一阶段探索概要（v4.5 / v5 单指标立项与分阶演进规划）**：
+  - **阶段一 · `v4.5-a`（工程治理、提权/白盒策略与三层重业务解耦）**：
+    - **代码质量与防僵尸生命周期规范**：拆解大型状态协调器、结构化诊断黑匣子（每轨 RTT/吞吐/根因码）、全关闭路径分级并行有界超时、非守护线程零泄漏审计与双路径退出零残留 CI 守卫；
+    - **四级提权栈 × 双面人工白盒策略 × 智能决策引导**：建立 `App Normal` / `Shizuku-ADB` / `Sui` / 原生 `Direct-Root`（KernelSU·Magisk，彻底脱钩 Shizuku）四级提权逐层能力匹配，提供「授权路径白盒化 + 管线决策白盒化」全透明操控、一键紧急回滚及基于硬件/遥测指纹的智能推荐引导；
+    - **接入许可 / 控制面 / 数据管线三层解耦**：彻底分离 L1 发现许可、L2 独立控制会话与 L3 多轨数据面生命周期，根治 mDNS/扫码场景启用 `USB_ADB` 管线时的建连失败，实现按需拉起 `adb forward` 与单轨不可达优雅降级；
+    - **主流代理与软路由直连避坑**：保障 PC（Clash/Mihomo `Meta Tunnel`、Wintun、WireGuard、旁路由）与 Android（`VpnService tun0`）环境下私有网段直连与扫码必通。
+  - **阶段二 · `v4.5-b`（物理链路平行极限、代理深治、Root 零挂载基座与底座现代化）**：
+    - **USB 极限与 ColorOS 同线四协议归因**：横向实测标定 MTP vs RNDIS vs CDC-NCM（`qmult` / NTB / Win11 `UsbNcm.sys`）vs `adb over NCM` 旁路加速，支持会话期多轨动态热插拔与共享 `adb daemon` 防连坐清理；
+    - **Wi-Fi 7 MLO、多频并发与驱动配置归因**：全链路木桶分段标定（5GbE/10GbE 回程与路由 STR/EMLSR）、单口 MLO 自适应流数拐点、多物理网卡并发与只读驱动配置边界分析；
+    - **独立 VPN / 透明代理与隐藏态代理路由治理**：面向无 `tun0` 透明代理（eBPF / `TPROXY` / `nftables`）与隐藏态 VPN 场景，构建不依赖表象标志的真实路径探测归因与分提权层白盒直连协同；
+    - **Root / KernelSU 零挂载运行态平行调优基座**：以对称插件（USB ∥ Wi-Fi ∥ 私有路由 ∥ 进程守护）在纯运行态落地 `ncm,adb`、`qmult`、RPS/IRQ 错核绑核与分介质拥塞实测，配套 `pipe EOF`/`pidfd` 崩溃自愈看门狗与 `tmpfs` 快照（异常强杀 ≤5s 无痕回滚，非 Root 设备 100% 优雅降级；可选用户态配置模块仅在运行态证伪后条件评估，内核态 KPM 驱动改造明确划出主仓）；
+    - **工具链、依赖库与 CI 现代化**：评估 Gradle/AGP/CameraX 升级、Android 15+ 原生 `.so` 16 KB ELF 页对齐、`targetSdk 35` 前台服务合规、`jmdns:3.5.9` 线程泄漏根治及 GitHub Actions Windows Runner 常态化门禁。
+  - **阶段三 · `v5.0`（下一代传输引擎与现代跨端 UI 壳）**：
+    - **断点续传与原地整片整合**：Chunk Bitmap/Journal 持久化、`.hfxpart` 原地乱序写与原子 `rename`（零二次磁盘拷贝）及分片级快速校验；
+    - **海量小文件管线与异构调度算法**：在线内存归并流（Streaming Bundle，零临时归档文件）与异构快慢轨动态块分配及尾段工作窃取（Work-Stealing）；
+    - **现状体验基线与现代跨端 UI 壳演进**：基于版本化 IPC 契约承载双面白盒控制台、智能引导卡片与独立成行快捷路径跳转标签栏，并将 OS 内核级进程树托管（Windows Win32 Job Object / Linux `PDEATHSIG` / macOS `kqueue`）列为全壳强制准入红线。
 
 ---
 
