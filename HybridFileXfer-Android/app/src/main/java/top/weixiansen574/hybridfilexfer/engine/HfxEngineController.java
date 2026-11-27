@@ -355,10 +355,13 @@ public class HfxEngineController implements AutoCloseable {
             throw new ControllerException(JsonRpcError.INVALID_PARAMS, "Invalid QR URI: " + e.getMessage());
         }
 
+        final List<IpcDtos.RailSelection> requestedRails = (params.selectedRails != null && !params.selectedRails.isEmpty())
+                ? new ArrayList<>(params.selectedRails) : null;
+
         pairExecutor.submit(new Runnable() {
             @Override
             public void run() {
-                runPairingWorkflow(payload);
+                runPairingWorkflow(payload, requestedRails);
             }
         });
         String label = (payload.hostName != null && !payload.hostName.isEmpty()) ? payload.hostName : payload.pcId;
@@ -387,7 +390,8 @@ public class HfxEngineController implements AutoCloseable {
         return new IpcPayloads.OkResult(removed, removed ? "Peer removed" : "Peer not found");
     }
 
-    private void runPairingWorkflow(final PairUriCodec.PairPayload payload) {
+    private void runPairingWorkflow(final PairUriCodec.PairPayload payload,
+                                    final List<IpcDtos.RailSelection> requestedRails) {
         final List<String> advertisedIps = new ArrayList<>();
         final String[] detectedUsbType = new String[1];
 
@@ -404,7 +408,7 @@ public class HfxEngineController implements AutoCloseable {
                             PairUriCodec.PairPayload p, byte[] pairSecret) throws Exception {
                         trustedPcStore.registerPendingPairing(
                                 p.pcId, p.hostName, pairSecret, p.ips, 120_000L, false);
-                        ensureServerListeningForPairing();
+                        ensureServerListeningForPairing(requestedRails);
                         collectAdvertisableMobileIps(advertisedIps, detectedUsbType);
                         return new PairClient.PreparedServerInfo(activeServerPort, advertisedIps, detectedUsbType[0]);
                     }
@@ -449,7 +453,7 @@ public class HfxEngineController implements AutoCloseable {
                 });
     }
 
-    private void ensureServerListeningForPairing() throws Exception {
+    private void ensureServerListeningForPairing(List<IpcDtos.RailSelection> requestedRails) throws Exception {
         if (state == SessionState.CONNECTED || state == SessionState.TRANSFERRING) {
             stopServer();
         }
@@ -460,6 +464,9 @@ public class HfxEngineController implements AutoCloseable {
             startParams.localBufferCount = defaultPairLocalBuffers;
             startParams.remoteBufferCount = defaultPairRemoteBuffers;
             startParams.authRequired = true;
+            if (requestedRails != null && !requestedRails.isEmpty()) {
+                startParams.selectedRails = new ArrayList<>(requestedRails);
+            }
             startServer(startParams);
         }
         CountDownLatch boundLatch = this.activeServerBoundLatch;

@@ -95,6 +95,7 @@ public class PcEngineRuntime implements AutoCloseable {
         public boolean autoConnectTrustedPeers = false;
         public long autoConnectDiscoveryWaitMs = 2000L;
         public boolean simulateBlockedPairPortForTest = false;
+        public boolean enableOnDemandAdbOnLoopbackForTest = false;
         public List<String> overrideQrCandidateIps;
 
         public EngineConfig() {
@@ -118,6 +119,7 @@ public class PcEngineRuntime implements AutoCloseable {
             c.autoConnectTrustedPeers = this.autoConnectTrustedPeers;
             c.autoConnectDiscoveryWaitMs = Math.max(0L, this.autoConnectDiscoveryWaitMs);
             c.simulateBlockedPairPortForTest = this.simulateBlockedPairPortForTest;
+            c.enableOnDemandAdbOnLoopbackForTest = this.enableOnDemandAdbOnLoopbackForTest;
             c.overrideQrCandidateIps = this.overrideQrCandidateIps != null
                     ? new ArrayList<>(this.overrideQrCandidateIps) : null;
             return c;
@@ -315,7 +317,7 @@ public class PcEngineRuntime implements AutoCloseable {
             }
             params.host = candidateIp;
             try {
-                connectInternal(params, pairSecret, true);
+                connectInternal(params, pairSecret, true, peer.deviceName);
                 if (viaFallbackMdns) {
                     emitPairSucceeded(peer, true);
                 }
@@ -546,10 +548,12 @@ public class PcEngineRuntime implements AutoCloseable {
         List<String> candidateIps = new ArrayList<>();
         int targetPort = p.port > 0 ? p.port : ProtocolConstants.DEFAULT_CONTROL_PORT;
         String targetDeviceId = p.deviceId;
+        String targetDeviceName = null;
         byte[] pairSecret = null;
 
         if (peer != null) {
             targetDeviceId = peer.deviceId;
+            targetDeviceName = peer.deviceName;
             if (peer.port > 0) {
                 targetPort = peer.port;
             }
@@ -559,6 +563,7 @@ public class PcEngineRuntime implements AutoCloseable {
             TrustedPeerStore.TrustedPeerRecord stored = trustedPeerStore.getPeer(p.deviceId.trim());
             if (stored != null && !stored.lastIps.isEmpty()) {
                 targetDeviceId = stored.deviceId;
+                targetDeviceName = stored.deviceName;
                 targetPort = stored.port;
                 candidateIps.addAll(mdnsManager.rankPeerIps(stored.lastIps));
                 pairSecret = trustedPeerStore.getPairSecret(stored.deviceId);
@@ -578,10 +583,14 @@ public class PcEngineRuntime implements AutoCloseable {
             attempt.host = ip;
             attempt.port = targetPort;
             attempt.deviceId = targetDeviceId;
+            attempt.serial = p.serial;
+            attempt.adbPath = p.adbPath;
+            attempt.adbLegacy = p.adbLegacy;
+            attempt.adbStreams = p.adbStreams;
             attempt.homeDir = p.homeDir;
             attempt.autoSubnetBind = p.autoSubnetBind;
             try {
-                return connectInternal(attempt, pairSecret, true);
+                return connectInternal(attempt, pairSecret, true, targetDeviceName);
             } catch (EngineException e) {
                 lastError = e;
             }
@@ -642,6 +651,13 @@ public class PcEngineRuntime implements AutoCloseable {
     private IpcPayloads.OkResult connectInternal(IpcPayloads.SessionConnectParams p,
                                                  byte[] pairSecret,
                                                  boolean allowFromPairingOrDiscovering) throws EngineException {
+        return connectInternal(p, pairSecret, allowFromPairingOrDiscovering, resolvePeerDeviceName(p));
+    }
+
+    private IpcPayloads.OkResult connectInternal(IpcPayloads.SessionConnectParams p,
+                                                 byte[] pairSecret,
+                                                 boolean allowFromPairingOrDiscovering,
+                                                 String peerDeviceName) throws EngineException {
         String mode = normalizeConnectMode(p);
         int port = p.port > 0 ? p.port : ProtocolConstants.DEFAULT_CONTROL_PORT;
 
@@ -660,10 +676,13 @@ public class PcEngineRuntime implements AutoCloseable {
         }
 
         AdbManager adbManager = null;
+        final AtomicReference<AdbManager> lazyAdbHolder = new AtomicReference<>(null);
         JdkHFXClient client = null;
         try {
             String serverAddress;
-            int requestedAdbStreams = p.adbStreams != null ? p.adbStreams : 0;
+            int requestedAdbStreams = p.adbStreams != null
+                    ? p.adbStreams
+                    : (config.adbConfig.overrideStreams != null ? config.adbConfig.overrideStreams : 0);
 
             if ("adb".equals(mode)) {
                 AdbManager.AdbConfig adbCfg = mergeAdbConfig(p);
@@ -678,7 +697,7 @@ public class PcEngineRuntime implements AutoCloseable {
                     String errDetail = !forward.stderr.isEmpty() ? forward.stderr.trim() : "adb forward failed";
                     throw new EngineException(JsonRpcError.CONNECTION_FAILED, errDetail);
                 }
-                if (forward.capability != null && p.adbStreams == null) {
+                if (forward.capability != null && p.adbStreams == null && config.adbConfig.overrideStreams == null) {
                     requestedAdbStreams = forward.capability.recommendedStreams;
                 }
                 serverAddress = "127.0.0.1";
@@ -693,83 +712,123 @@ public class PcEngineRuntime implements AutoCloseable {
             String resolvedHomeDir = resolveEffectiveHomeDir(p.homeDir);
             this.effectiveHomeDir = resolvedHomeDir;
 
-            client = new JdkHFXClient(serverAddress, port, resolvedHomeDir, subnetBindResolver);
-            client.setClientId(this.deviceId);
-            if (pairSecret != null && pairSecret.length > 0) {
-                client.setPairSecret(pairSecret);
+            int maxAttempts = "adb".equals(mode) ? 1 : 2;
+            boolean connectedOk = false;
+            String finalErrorMsg = "Connection failed";
+
+            for (int attemptIdx = 0; attemptIdx < maxAttempts; attemptIdx++) {
+                boolean excludeAdbRail = (attemptIdx == 1);
+
+                client = new JdkHFXClient(serverAddress, port, resolvedHomeDir, subnetBindResolver);
+                client.setClientId(this.deviceId);
+                if (pairSecret != null && pairSecret.length > 0) {
+                    client.setPairSecret(pairSecret);
+                }
+                if (requestedAdbStreams > 0) {
+                    client.setRequestedAdbStreams(requestedAdbStreams);
+                }
+                if (excludeAdbRail) {
+                    client.setClientCapabilities(ProtocolConstants.ALL_V4_CAPS | ProtocolConstants.CAP_EXCLUDE_ADB_RAIL);
+                } else if (!"adb".equals(mode)
+                        && (!isLoopbackHost(serverAddress) || config.enableOnDemandAdbOnLoopbackForTest)) {
+                    final String effectivePeerName = peerDeviceName;
+                    client.setAdbRailPreparer(rails ->
+                            prepareAdbRailOnDemand(p, port, effectivePeerName, lazyAdbHolder));
+                }
+                client.setAutoSubnetBindEnabled(p.autoSubnetBind && config.defaultAutoSubnetBind);
+                client.setSpeedMonitorIntervalMs(config.progressThrottleMs);
+
+                final AtomicReference<String> connectError = new AtomicReference<>(null);
+                final List<IpcDtos.RailStatusInfo> connectingRails = Collections.synchronizedList(new ArrayList<>());
+
+                boolean ok = client.connect(new ConnectServerCallback() {
+                    @Override
+                    public void onConnectingControlChannel(String address, int targetPort) {
+                    }
+
+                    @Override
+                    public void onVersionMismatch(int localVersion, int remoteVersion) {
+                        connectError.set("Protocol version mismatch: local=" + localVersion + ", remote=" + remoteVersion);
+                    }
+
+                    @Override
+                    public void onConnectControlFailed() {
+                        connectError.compareAndSet(null, "Failed to connect control channel to "
+                                + serverAddress + ":" + port);
+                    }
+
+                    @Override
+                    public void onAuthFailed(String reason) {
+                        connectError.set("Authentication failed: " + reason);
+                    }
+
+                    @Override
+                    public void onConnectingTransferChannel(String name, InetAddress inetAddress, InetAddress bindAddress) {
+                        IpcDtos.RailStatusInfo info = new IpcDtos.RailStatusInfo();
+                        info.railId = connectingRails.size();
+                        info.name = name;
+                        info.address = inetAddress != null ? inetAddress.getHostAddress() : null;
+                        info.bindAddress = bindAddress != null ? bindAddress.getHostAddress() : null;
+                        info.state = "CONNECTING";
+                        connectingRails.add(info);
+                        emitRailStatus(new ArrayList<>(connectingRails));
+                    }
+
+                    @Override
+                    public void onConnectTransferChannelFailed(String name, InetAddress inetAddress, Exception e) {
+                        connectError.set("Data channel failed for " + name + " ("
+                                + (inetAddress != null ? inetAddress.getHostAddress() : "unknown") + "): "
+                                + (e != null ? e.getMessage() : "error"));
+                    }
+
+                    @Override
+                    public void onOOM(int createdBuffers, int requiredBuffers, long maxMemoryMB, String osArch) {
+                        connectError.set("Local OOM allocating transfer buffers: "
+                                + createdBuffers + "/" + requiredBuffers + " (maxHeap=" + maxMemoryMB + "MB)");
+                    }
+
+                    @Override
+                    public void onRemoteOOM() {
+                        connectError.set("Remote server OOM allocating transfer buffers");
+                    }
+
+                    @Override
+                    public void onConnectSuccess(List<String> channelNames) {
+                    }
+                });
+
+                if (ok) {
+                    connectedOk = true;
+                    break;
+                }
+
+                finalErrorMsg = connectError.get() != null ? connectError.get() : "Connection failed";
+                if (!excludeAdbRail && !"adb".equals(mode) && client.isAdbRailFailedWithNonAdbAlternatives()) {
+                    String reason = client.getLastAdbRailFailureReason();
+                    client.requestShutdown();
+                    client = null;
+                    AdbManager failedLazyAdb = lazyAdbHolder.getAndSet(null);
+                    if (failedLazyAdb != null) {
+                        try {
+                            failedLazyAdb.close();
+                        } catch (Exception ignored) {
+                        }
+                    }
+                    emitEvent(IpcEvents.DIAGNOSTIC_WARNING, new IpcPayloads.DiagnosticWarningPayload(
+                            "ADB_RAIL_SKIPPED_FALLBACK",
+                            "USB_ADB rail unavailable (" + (reason != null ? reason : finalErrorMsg)
+                                    + "); reconnecting over remaining USB-NIC/Wi-Fi rails."));
+                    continue;
+                }
+                break;
             }
-            if (requestedAdbStreams > 0) {
-                client.setRequestedAdbStreams(requestedAdbStreams);
-            }
-            client.setAutoSubnetBindEnabled(p.autoSubnetBind && config.defaultAutoSubnetBind);
-            client.setSpeedMonitorIntervalMs(config.progressThrottleMs);
 
-            final AtomicReference<String> connectError = new AtomicReference<>(null);
-            final List<IpcDtos.RailStatusInfo> connectingRails = Collections.synchronizedList(new ArrayList<>());
-
-            boolean ok = client.connect(new ConnectServerCallback() {
-                @Override
-                public void onConnectingControlChannel(String address, int targetPort) {
-                }
-
-                @Override
-                public void onVersionMismatch(int localVersion, int remoteVersion) {
-                    connectError.set("Protocol version mismatch: local=" + localVersion + ", remote=" + remoteVersion);
-                }
-
-                @Override
-                public void onConnectControlFailed() {
-                    connectError.compareAndSet(null, "Failed to connect control channel to "
-                            + serverAddress + ":" + port);
-                }
-
-                @Override
-                public void onAuthFailed(String reason) {
-                    connectError.set("Authentication failed: " + reason);
-                }
-
-                @Override
-                public void onConnectingTransferChannel(String name, InetAddress inetAddress, InetAddress bindAddress) {
-                    IpcDtos.RailStatusInfo info = new IpcDtos.RailStatusInfo();
-                    info.railId = connectingRails.size();
-                    info.name = name;
-                    info.address = inetAddress != null ? inetAddress.getHostAddress() : null;
-                    info.bindAddress = bindAddress != null ? bindAddress.getHostAddress() : null;
-                    info.state = "CONNECTING";
-                    connectingRails.add(info);
-                    emitRailStatus(new ArrayList<>(connectingRails));
-                }
-
-                @Override
-                public void onConnectTransferChannelFailed(String name, InetAddress inetAddress, Exception e) {
-                    connectError.set("Data channel failed for " + name + " ("
-                            + (inetAddress != null ? inetAddress.getHostAddress() : "unknown") + "): "
-                            + (e != null ? e.getMessage() : "error"));
-                }
-
-                @Override
-                public void onOOM(int createdBuffers, int requiredBuffers, long maxMemoryMB, String osArch) {
-                    connectError.set("Local OOM allocating transfer buffers: "
-                            + createdBuffers + "/" + requiredBuffers + " (maxHeap=" + maxMemoryMB + "MB)");
-                }
-
-                @Override
-                public void onRemoteOOM() {
-                    connectError.set("Remote server OOM allocating transfer buffers");
-                }
-
-                @Override
-                public void onConnectSuccess(List<String> channelNames) {
-                }
-            });
-
-            if (!ok) {
-                String msg = connectError.get() != null ? connectError.get() : "Connection failed";
-                throw new EngineException(JsonRpcError.CONNECTION_FAILED, msg);
+            if (!connectedOk) {
+                throw new EngineException(JsonRpcError.CONNECTION_FAILED, finalErrorMsg);
             }
 
             final JdkHFXClient establishedClient = client;
-            final AdbManager establishedAdb = adbManager;
+            final AdbManager establishedAdb = adbManager != null ? adbManager : lazyAdbHolder.getAndSet(null);
             final CountDownLatch loopReady = new CountDownLatch(1);
             final CountDownLatch endedLatch = new CountDownLatch(1);
 
@@ -808,12 +867,84 @@ public class PcEngineRuntime implements AutoCloseable {
 
             return new IpcPayloads.OkResult(true, "Connected to " + serverAddress + ":" + port);
         } catch (EngineException e) {
-            cleanupFailedConnect(client, adbManager, e.getMessage());
+            AdbManager toClose = adbManager != null ? adbManager : lazyAdbHolder.getAndSet(null);
+            cleanupFailedConnect(client, toClose, e.getMessage());
             throw e;
         } catch (Exception e) {
-            cleanupFailedConnect(client, adbManager, e.getMessage());
+            AdbManager toClose = adbManager != null ? adbManager : lazyAdbHolder.getAndSet(null);
+            cleanupFailedConnect(client, toClose, e.getMessage());
             throw new EngineException(JsonRpcError.CONNECTION_FAILED,
                     e.getMessage() != null ? e.getMessage() : e.toString(), e);
+        }
+    }
+
+    private top.weixiansen574.hybridfilexfer.core.HFXClient.AdbRailPrepareResult prepareAdbRailOnDemand(
+            IpcPayloads.SessionConnectParams p,
+            int port,
+            String peerDeviceName,
+            AtomicReference<AdbManager> lazyAdbHolder) {
+        if (lazyAdbHolder.get() != null) {
+            return top.weixiansen574.hybridfilexfer.core.HFXClient.AdbRailPrepareResult.ready();
+        }
+        AdbManager mgr = adbManagerFactory.create(mergeAdbConfig(p), this::emitEvent);
+        mgr.registerShutdownHook();
+        lazyAdbHolder.set(mgr);
+
+        AdbManager.ForwardResult forward = mgr.forwardPortForPeer(port, port, p.serial, peerDeviceName);
+        if (forward.capability != null) {
+            this.lastAdbCapability = forward.capability;
+        }
+        if (forward.success) {
+            return top.weixiansen574.hybridfilexfer.core.HFXClient.AdbRailPrepareResult.ready();
+        }
+        if (lazyAdbHolder.compareAndSet(mgr, null)) {
+            try {
+                mgr.close();
+            } catch (Exception ignored) {
+            }
+        }
+        String errDetail = !forward.stderr.isEmpty() ? forward.stderr.trim() : "adb forward failed";
+        return top.weixiansen574.hybridfilexfer.core.HFXClient.AdbRailPrepareResult.failed(errDetail, true);
+    }
+
+    private String resolvePeerDeviceName(IpcPayloads.SessionConnectParams p) {
+        if (p == null) {
+            return null;
+        }
+        if (p.deviceId != null && !p.deviceId.trim().isEmpty()) {
+            TrustedPeerStore.TrustedPeerRecord rec = trustedPeerStore.getPeer(p.deviceId.trim());
+            if (rec != null && rec.deviceName != null && !rec.deviceName.trim().isEmpty()) {
+                return rec.deviceName.trim();
+            }
+        }
+        if (p.host != null && !p.host.trim().isEmpty() && !"adb".equalsIgnoreCase(p.host.trim())) {
+            String host = p.host.trim();
+            for (IpcDtos.PeerInfo peer : mdnsManager.getDiscoveredPeers()) {
+                if (peer.ips != null && peer.ips.contains(host)
+                        && peer.deviceName != null && !peer.deviceName.trim().isEmpty()) {
+                    return peer.deviceName.trim();
+                }
+            }
+            TrustedPeerStore.TrustedPeerRecord byIp = trustedPeerStore.findByIp(host);
+            if (byIp != null && byIp.deviceName != null && !byIp.deviceName.trim().isEmpty()) {
+                return byIp.deviceName.trim();
+            }
+        }
+        return null;
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        if (host == null) {
+            return false;
+        }
+        String h = host.trim().toLowerCase();
+        if ("localhost".equals(h) || "::1".equals(h) || "[::1]".equals(h) || h.startsWith("127.")) {
+            return true;
+        }
+        try {
+            return InetAddress.getByName(h).isLoopbackAddress();
+        } catch (Exception e) {
+            return false;
         }
     }
 

@@ -394,6 +394,86 @@ public class AdbManagerTest {
         assertEquals("unauthorized", parsed.get("UNAUTH01"));
     }
 
+    @Test
+    public void testParseDevicesLongOutputAndSelectBestSerialForPeer() {
+        String raw = "List of devices attached\n"
+                + "3B15B100P8E00000       device product:PJZ110 model:PJZ110 device:OP5D2BL1 transport_id:4\n"
+                + "192.168.50.130:5555    device product:PJZ110 model:PJZ110 device:OP5D2BL1 transport_id:5\n"
+                + "emulator-5554          device product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 transport_id:2\n"
+                + "DEAD0001               offline transport_id:9\n";
+        List<AdbManager.AdbDeviceInfo> parsed = AdbManager.parseDevicesLongOutput(raw);
+        assertEquals(4, parsed.size());
+        assertTrue(parsed.get(0).isOnline());
+        assertTrue(parsed.get(0).isPhysicalUsb());
+        assertEquals("PJZ110", parsed.get(0).model);
+        assertFalse(parsed.get(1).isPhysicalUsb());
+        assertFalse(parsed.get(2).isPhysicalUsb());
+        assertTrue(parsed.get(3).isOffline());
+
+        // Matches peer model "PJZ110" and prefers physical USB over wireless TCP ADB
+        assertEquals("3B15B100P8E00000", AdbManager.selectBestSerialForPeer(parsed, "PJZ110"));
+
+        // Without model match, still prefers unique physical USB device over emulator + wireless ADB
+        assertEquals("3B15B100P8E00000", AdbManager.selectBestSerialForPeer(parsed, "UnknownPhone"));
+
+        // Two distinct physical USB devices with no model match -> refuse to guess blindly
+        String twoUsbRaw = "List of devices attached\n"
+                + "USB_AAA                device product:A model:ModelA transport_id:1\n"
+                + "USB_BBB                device product:B model:ModelB transport_id:2\n";
+        List<AdbManager.AdbDeviceInfo> twoUsb = AdbManager.parseDevicesLongOutput(twoUsbRaw);
+        assertNull(AdbManager.selectBestSerialForPeer(twoUsb, "OtherModel"));
+        assertEquals("USB_BBB", AdbManager.selectBestSerialForPeer(twoUsb, "ModelB"));
+    }
+
+    @Test
+    public void testForwardPortForPeerResolvesSerialAndRecoversPortRebindError() {
+        String adb36 = "C:\\Tools\\adb36\\adb.exe";
+        FakeEnv env = new FakeEnv(true).env("PATH", "C:\\Tools\\adb36").file(adb36);
+
+        List<List<String>> cmds = new ArrayList<>();
+        final int[] forwardCalls = new int[]{0};
+
+        AdbManager.CommandExecutor exec = (cmd, envSpec, wd, timeoutMs) -> {
+            cmds.add(new ArrayList<>(cmd));
+            if (cmd.contains("version")) {
+                return new AdbManager.CommandResult(0, "Version 36.0.0-13206524\n", "");
+            }
+            if (cmd.contains("devices")) {
+                return new AdbManager.CommandResult(0,
+                        "List of devices attached\n"
+                                + "emulator-5554          device product:sdk_gphone64 model:sdk_gphone64 transport_id:1\n"
+                                + "3B15B100P8E00000       device product:PJZ110 model:PJZ110 transport_id:3\n", "");
+            }
+            if (cmd.contains("host-features") || cmd.contains("features")) {
+                return new AdbManager.CommandResult(0, "shell_v2,libusb,delayed_ack\n", "");
+            }
+            if (cmd.contains("forward") && cmd.contains("--remove")) {
+                return new AdbManager.CommandResult(0, "", "");
+            }
+            if (cmd.contains("forward")) {
+                forwardCalls[0]++;
+                if (forwardCalls[0] == 1) {
+                    return new AdbManager.CommandResult(1, "", "adb.exe: error: cannot rebind existing socket");
+                }
+                return new AdbManager.CommandResult(0, "5740\n", "");
+            }
+            return new AdbManager.CommandResult(0, "", "");
+        };
+
+        AdbManager mgr = new AdbManager(new AdbManager.AdbConfig(), exec, env, null);
+        AdbManager.ForwardResult res = mgr.forwardPortForPeer(5740, 5740, null, "PJZ110");
+        assertTrue("forwardPortForPeer must resolve USB device and recover stale rebind", res.success);
+        assertEquals("3B15B100P8E00000", res.serial);
+        assertEquals(2, forwardCalls[0]);
+        assertTrue("Must pass resolved -s 3B15B100P8E00000 to adb forward",
+                cmds.stream().anyMatch(c -> c.contains("forward") && c.contains("-s") && c.contains("3B15B100P8E00000")));
+        assertTrue("Must remove stale forward rule before retrying rebind",
+                cmds.stream().anyMatch(c -> c.contains("forward") && c.contains("--remove")));
+
+        mgr.close();
+        assertEquals(0, mgr.getActiveForwardCount());
+    }
+
     // ---- Test doubles ----
 
     private static final class FakeEnv implements AdbManager.EnvironmentProvider {

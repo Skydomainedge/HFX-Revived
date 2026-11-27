@@ -487,6 +487,9 @@ public class MdnsManager implements AutoCloseable {
             if (!(targetAddr instanceof Inet4Address)) {
                 return 100;
             }
+            if (targetAddr.isLoopbackAddress()) {
+                return 90;
+            }
             byte[] tBytes = targetAddr.getAddress();
             int bestScore = 50;
             for (IpcDtos.NicInfo nic : localNics) {

@@ -128,7 +128,7 @@ public class ProtocolV4LoopbackTest {
         }
     }
 
-    private static final class TestClient extends HFXClient {
+    private static class TestClient extends HFXClient {
         TestClient(String host, int port, String homeDir) {
             super(host, port, homeDir);
         }
@@ -374,6 +374,111 @@ public class ProtocolV4LoopbackTest {
             dummy1.close();
             dummy2.close();
             dummy3.close();
+        }
+    }
+
+    @Test
+    public void testExcludeAdbRailCapabilityDropsAdbAndPreservesSoleAdbRail() throws Exception {
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        final List<ServerNetInterface> mixedRails = Arrays.asList(
+                new ServerNetInterface("rndis0", loopback, null, RailType.USB_NIC, 1),
+                new ServerNetInterface("wlan0", loopback, null, RailType.WIFI, 1),
+                new ServerNetInterface(ProtocolConstants.USB_ADB_RAIL_NAME, loopback, null, RailType.ADB, 1)
+        );
+
+        final TestServer server = new TestServer();
+        server.setPreferredBlockSize(256 * 1024);
+        final CountDownLatch serverListening = new CountDownLatch(1);
+        final CountDownLatch serverConnected = new CountDownLatch(1);
+        final AtomicInteger acceptFailures = new AtomicInteger(0);
+
+        ExecutorService exec = Executors.newCachedThreadPool();
+        try {
+            Future<?> serverFuture = exec.submit(() -> {
+                try {
+                    server.startServer(0, mixedRails, 16, 16, new ServerHandshakeCallback() {
+                        @Override public void onBindFailed(int port) {}
+                        @Override public void onServerStarted() { serverListening.countDown(); }
+                        @Override public void onRailAccepted(String name, int railId, int streamIndex, int streamCount) {}
+                        @Override public void onAcceptFailed(String name) { acceptFailures.incrementAndGet(); }
+                        @Override public void onRemoteOOM() {}
+                        @Override public void onLocalOOM(int created, int localBufferCount) {}
+                        @Override public void onConnectSuccess() { serverConnected.countDown(); }
+                    });
+                } catch (IOException ignored) {
+                }
+            });
+
+            assertTrue("Server must start", serverListening.await(5, TimeUnit.SECONDS));
+            int port = server.getBoundPort();
+
+            // Attempt 1: client fails ADB rail preparation -> aborts cleanly while flagging non-ADB alternatives
+            TestClient attempt1 = new TestClient("127.0.0.1", port, tempFolder.getRoot().getAbsolutePath()) {
+                @Override
+                protected AdbRailPrepareResult prepareAdbRailBeforeDataConnect(List<ServerNetInterface> rails) {
+                    return AdbRailPrepareResult.failed("No online ADB device", true);
+                }
+            };
+            assertFalse("Attempt 1 should abort when ADB prep fails",
+                    attempt1.connect(new RecordingConnectCallback()));
+            assertTrue("Must flag ADB failure with non-ADB alternatives",
+                    attempt1.isAdbRailFailedWithNonAdbAlternatives());
+            assertEquals("No online ADB device", attempt1.getLastAdbRailFailureReason());
+
+            // Attempt 2: client retries with CAP_EXCLUDE_ADB_RAIL -> server drops USB_ADB and connects rndis0 + wlan0
+            TestClient attempt2 = new TestClient("127.0.0.1", port, tempFolder.getRoot().getAbsolutePath());
+            attempt2.setClientCapabilities(ProtocolConstants.ALL_V4_CAPS | ProtocolConstants.CAP_EXCLUDE_ADB_RAIL);
+            final AtomicReference<List<String>> connectedNames = new AtomicReference<>();
+            assertTrue("Attempt 2 with CAP_EXCLUDE_ADB_RAIL must succeed",
+                    attempt2.connect(new RecordingConnectCallback() {
+                        @Override public void onConnectSuccess(List<String> channelNames) {
+                            connectedNames.set(channelNames);
+                        }
+                    }));
+            assertTrue("Server must complete handshake on fallback attempt", serverConnected.await(5, TimeUnit.SECONDS));
+            assertEquals(1, acceptFailures.get());
+            assertEquals(Arrays.asList("rndis0", "wlan0"), connectedNames.get());
+            assertEquals(Arrays.asList("rndis0", "wlan0"), server.getDistinctRailNames());
+
+            attempt2.disconnectGracefully();
+            server.disconnect();
+            serverFuture.get(5, TimeUnit.SECONDS);
+
+            // Verify sole USB_ADB rail is NEVER dropped even if CAP_EXCLUDE_ADB_RAIL is set
+            final TestServer adbOnlyServer = new TestServer();
+            adbOnlyServer.setPreferredBlockSize(256 * 1024);
+            final CountDownLatch adbOnlyListening = new CountDownLatch(1);
+            final CountDownLatch adbOnlyConnected = new CountDownLatch(1);
+            Future<?> adbOnlyFuture = exec.submit(() -> {
+                try {
+                    adbOnlyServer.startServer(0,
+                            Collections.singletonList(new ServerNetInterface(
+                                    ProtocolConstants.USB_ADB_RAIL_NAME, loopback, null, RailType.ADB, 1)),
+                            16, 16, new ServerHandshakeCallback() {
+                                @Override public void onBindFailed(int port) {}
+                                @Override public void onServerStarted() { adbOnlyListening.countDown(); }
+                                @Override public void onRailAccepted(String name, int railId, int streamIndex, int streamCount) {}
+                                @Override public void onAcceptFailed(String name) {}
+                                @Override public void onRemoteOOM() {}
+                                @Override public void onLocalOOM(int created, int localBufferCount) {}
+                                @Override public void onConnectSuccess() { adbOnlyConnected.countDown(); }
+                            });
+                } catch (IOException ignored) {
+                }
+            });
+            assertTrue(adbOnlyListening.await(5, TimeUnit.SECONDS));
+            TestClient adbOnlyClient = new TestClient("127.0.0.1", adbOnlyServer.getBoundPort(),
+                    tempFolder.getRoot().getAbsolutePath());
+            adbOnlyClient.setClientCapabilities(ProtocolConstants.ALL_V4_CAPS | ProtocolConstants.CAP_EXCLUDE_ADB_RAIL);
+            assertTrue("Sole ADB rail must be preserved", adbOnlyClient.connect(new RecordingConnectCallback()));
+            assertTrue(adbOnlyConnected.await(5, TimeUnit.SECONDS));
+            assertEquals(Collections.singletonList(ProtocolConstants.USB_ADB_RAIL_NAME),
+                    adbOnlyServer.getDistinctRailNames());
+            adbOnlyClient.disconnectGracefully();
+            adbOnlyServer.disconnect();
+            adbOnlyFuture.get(5, TimeUnit.SECONDS);
+        } finally {
+            exec.shutdownNow();
         }
     }
 

@@ -50,6 +50,7 @@ import top.weixiansen574.hybridfilexfer.core.protocol.HmacAuth;
 import top.weixiansen574.hybridfilexfer.core.protocol.PairCallbackMessage;
 import top.weixiansen574.hybridfilexfer.core.protocol.PairUriCodec;
 import top.weixiansen574.hybridfilexfer.core.protocol.ProtocolConstants;
+import top.weixiansen574.hybridfilexfer.core.protocol.RailType;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
@@ -411,6 +412,105 @@ public class AndroidPairingAndTrustedStoreTest {
                 assertTrue("pair_ack TXT must be cleared once paired", pairAckCleared.await(3, TimeUnit.SECONDS));
                 assertTrue("Controller must transition to CONNECTED", connected.await(5, TimeUnit.SECONDS));
                 assertTrue("PC must be persisted to trusted store", store.hasTrustedPeers());
+            } finally {
+                pcClient.requestShutdown();
+            }
+        }
+    }
+
+    @Test
+    public void testControllerQrPairingHonorsSelectedRailsAndSupportsExcludeAdbFallback() throws Exception {
+        final byte[] token = HmacAuth.generateRandomBytes(16);
+        final String pcId = "pc-exclude-adb";
+        final String pcName = "OMEN-NoAdb";
+        final String phoneId = "phone-wired-99";
+
+        int blockedPort;
+        try (ServerSocket closed = new ServerSocket(0)) {
+            blockedPort = closed.getLocalPort();
+        }
+
+        final CountDownLatch pairAckPublished = new CountDownLatch(1);
+        MdnsAdvertisementBridge spyMdns = new MdnsAdvertisementBridge() {
+            @Override
+            public void startAdvertising(int port, String deviceId, String deviceName,
+                                         List<String> ips, String usbType, String pairAck) {
+                if (pairAck != null && !pairAck.isEmpty()) {
+                    pairAckPublished.countDown();
+                }
+            }
+            @Override public void updatePairAck(String pairAck) {}
+            @Override public void stopAdvertising() {}
+        };
+
+        InMemoryPersistence db = new InMemoryPersistence();
+        TrustedPcStore store = new TrustedPcStore(db);
+        AtomicReference<LoopbackJvmServer> srvRef = new AtomicReference<>();
+        CountDownLatch connected = new CountDownLatch(1);
+
+        try (HfxEngineController controller = new HfxEngineController(
+                phoneId, "PJZ110", new UsbNicAdvisor(),
+                createLoopbackBackend(srvRef), 250L,
+                store, spyMdns, new PairClient(300))) {
+
+            controller.configurePairDefaults(0, 0, 16, 16);
+            controller.addEventListener((event, payload) -> {
+                if (IpcEvents.SESSION_STATE_CHANGED.equals(event)) {
+                    IpcPayloads.SessionStateChangedPayload sc = (IpcPayloads.SessionStateChangedPayload) payload;
+                    if (sc.current == SessionState.CONNECTED) {
+                        connected.countDown();
+                    }
+                }
+            });
+
+            IpcDtos.RailSelection rndis = new IpcDtos.RailSelection();
+            rndis.name = "rndis0";
+            rndis.ip = "127.0.0.1";
+            rndis.railType = RailType.USB_NIC.name();
+            rndis.streamCount = 1;
+
+            IpcDtos.RailSelection wifi = new IpcDtos.RailSelection();
+            wifi.name = "wlan0";
+            wifi.ip = "127.0.0.1";
+            wifi.railType = RailType.WIFI.name();
+            wifi.streamCount = 1;
+
+            IpcDtos.RailSelection adb = new IpcDtos.RailSelection();
+            adb.name = ProtocolConstants.USB_ADB_RAIL_NAME;
+            adb.ip = "127.0.0.1";
+            adb.railType = RailType.ADB.name();
+            adb.streamCount = 1;
+
+            String uri = PairUriCodec.encode(new PairUriCodec.PairPayload(
+                    1, pcId, pcName, blockedPort, token,
+                    Collections.singletonList("127.0.0.1"), pcName + ".local"));
+            IpcPayloads.PairSubmitUriParams params = new IpcPayloads.PairSubmitUriParams();
+            params.uri = uri;
+            params.selectedRails = Arrays.asList(rndis, wifi, adb);
+            assertTrue(controller.dispatch(null, IpcMethods.PAIR_SUBMIT_QR_URI, IpcJson.toJsonObject(params)).isSuccess());
+            assertTrue("Expected mDNS fallback activation", pairAckPublished.await(5, TimeUnit.SECONDS));
+
+            int mobilePort = srvRef.get().getBoundPort();
+            byte[] derivedSecret = HmacAuth.derivePairSecret(token, pcId, phoneId);
+
+            // PC connects requesting CAP_EXCLUDE_ADB_RAIL (e.g. after ADB forward failed)
+            LoopbackJvmClient pcClient = new LoopbackJvmClient("127.0.0.1", mobilePort, "/");
+            pcClient.setClientId(pcId);
+            pcClient.setPairSecret(derivedSecret);
+            pcClient.setClientCapabilities(ProtocolConstants.ALL_V4_CAPS | ProtocolConstants.CAP_EXCLUDE_ADB_RAIL);
+            try {
+                assertTrue("PC connect excluding ADB must succeed", pcClient.connect(new ConnectServerCallback() {
+                    @Override public void onConnectingControlChannel(String address, int port) {}
+                    @Override public void onVersionMismatch(int localVersion, int remoteVersion) {}
+                    @Override public void onConnectControlFailed() {}
+                    @Override public void onConnectingTransferChannel(String name, InetAddress inetAddress, InetAddress bindAddress) {}
+                    @Override public void onConnectTransferChannelFailed(String name, InetAddress inetAddress, Exception e) {}
+                    @Override public void onOOM(int createdBuffers, int requiredBuffers, long maxMemoryMB, String osArch) {}
+                    @Override public void onRemoteOOM() {}
+                    @Override public void onConnectSuccess(List<String> channelNames) {}
+                }));
+                assertTrue("Controller must transition to CONNECTED", connected.await(5, TimeUnit.SECONDS));
+                assertEquals(Arrays.asList("rndis0", "wlan0"), srvRef.get().getDistinctRailNames());
             } finally {
                 pcClient.requestShutdown();
             }

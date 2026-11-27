@@ -126,6 +126,7 @@ public class Main {
                                                CliOptions opts) throws Exception {
         final CountDownLatch flowDone = new CountDownLatch(1);
         final AtomicBoolean connected = new AtomicBoolean(false);
+        final AtomicBoolean postPairConnectFailed = new AtomicBoolean(false);
 
         runtime.addEventListener((eventName, payload) -> {
             handleEngineEvent(eventName, payload, opts.noToast);
@@ -140,6 +141,13 @@ public class Main {
                 if (!connected.get()) {
                     flowDone.countDown();
                 }
+            } else if (IpcEvents.DIAGNOSTIC_WARNING.equals(eventName)
+                    && payload instanceof IpcPayloads.DiagnosticWarningPayload) {
+                IpcPayloads.DiagnosticWarningPayload warn = (IpcPayloads.DiagnosticWarningPayload) payload;
+                if ("POST_PAIR_CONNECT_FAILED".equals(warn.code) && !connected.get()) {
+                    postPairConnectFailed.set(true);
+                    flowDone.countDown();
+                }
             }
         });
 
@@ -150,6 +158,10 @@ public class Main {
             System.out.println("[mDNS] Searching for trusted devices on local USB/LAN interfaces...");
             IpcPayloads.SessionConnectParams autoParams = new IpcPayloads.SessionConnectParams();
             autoParams.mode = "auto";
+            autoParams.serial = opts.device;
+            autoParams.adbPath = opts.adbPath;
+            autoParams.adbLegacy = opts.adbLegacy;
+            autoParams.adbStreams = opts.adbStreams;
             autoParams.homeDir = resolvedHomeDir;
             autoParams.autoSubnetBind = !opts.disableAutoBind;
             try {
@@ -157,7 +169,11 @@ public class Main {
                 autoConnected = true;
                 connected.set(true);
                 Strings.printf("connect_success");
-            } catch (PcEngineRuntime.EngineException ignored) {
+            } catch (PcEngineRuntime.EngineException e) {
+                String msg = e.getMessage();
+                if (msg != null && !msg.contains("No trusted peer discovered")) {
+                    System.err.println("[WARN] mDNS auto-connect failed: " + msg);
+                }
                 System.out.println("[mDNS] No trusted device discovered nearby; starting PNG QR pairing...");
             }
         }
@@ -177,8 +193,9 @@ public class Main {
 
         if (connected.get()) {
             runtime.awaitSessionEnd();
+            return 0;
         }
-        return 0;
+        return postPairConnectFailed.get() ? 1 : 0;
     }
 
     private static void handleEngineEvent(String eventName, Object payload, boolean noToast) {

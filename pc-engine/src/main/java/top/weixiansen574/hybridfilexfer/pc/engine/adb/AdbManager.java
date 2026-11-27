@@ -287,6 +287,51 @@ public class AdbManager implements AutoCloseable {
     }
 
     /**
+     * Parsed entry from {@code adb devices -l}.
+     */
+    public static final class AdbDeviceInfo {
+        public final String serial;
+        public final String state;
+        public final String model;
+        public final String product;
+        public final String device;
+        public final String usb;
+        public final String transportId;
+
+        public AdbDeviceInfo(String serial, String state, String model, String product,
+                             String device, String usb, String transportId) {
+            this.serial = serial;
+            this.state = state;
+            this.model = model;
+            this.product = product;
+            this.device = device;
+            this.usb = usb;
+            this.transportId = transportId;
+        }
+
+        public boolean isOnline() {
+            return "device".equals(state);
+        }
+
+        public boolean isOffline() {
+            return "offline".equals(state);
+        }
+
+        public boolean isPhysicalUsb() {
+            if (serial == null || serial.isEmpty()) {
+                return false;
+            }
+            if (usb != null && !usb.isEmpty()) {
+                return true;
+            }
+            String lower = serial.toLowerCase(Locale.ROOT);
+            return !lower.startsWith("emulator-")
+                    && !serial.contains(":")
+                    && !lower.contains("._adb-tls-connect");
+        }
+    }
+
+    /**
      * Abstraction over OS process invocation for deterministic unit testing.
      */
     @FunctionalInterface
@@ -627,12 +672,159 @@ public class AdbManager implements AutoCloseable {
         return devices;
     }
 
+    /**
+     * Parses {@code adb devices -l} (or plain {@code adb devices}) output into structured records.
+     */
+    public static List<AdbDeviceInfo> parseDevicesLongOutput(String output) {
+        List<AdbDeviceInfo> result = new ArrayList<>();
+        if (output == null || output.isEmpty()) {
+            return result;
+        }
+        String[] lines = output.split("\\r?\\n");
+        for (String line : lines) {
+            String trimmed = line.trim();
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+            String lower = trimmed.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("list of devices") || lower.startsWith("*")
+                    || lower.startsWith("adb:") || lower.startsWith("adb.exe:")
+                    || lower.startsWith("error:")) {
+                continue;
+            }
+            String[] parts = trimmed.split("\\s+");
+            if (parts.length < 2 || parts[0].isEmpty() || parts[1].isEmpty()) {
+                continue;
+            }
+            String serial = parts[0];
+            String state = parts[1].toLowerCase(Locale.ROOT);
+            String model = null;
+            String product = null;
+            String device = null;
+            String usb = null;
+            String transportId = null;
+            for (int i = 2; i < parts.length; i++) {
+                String token = parts[i];
+                int colon = token.indexOf(':');
+                if (colon <= 0 || colon >= token.length() - 1) {
+                    continue;
+                }
+                String k = token.substring(0, colon).toLowerCase(Locale.ROOT);
+                String v = token.substring(colon + 1);
+                if ("model".equals(k)) {
+                    model = v;
+                } else if ("product".equals(k)) {
+                    product = v;
+                } else if ("device".equals(k)) {
+                    device = v;
+                } else if ("usb".equals(k)) {
+                    usb = v;
+                } else if ("transport_id".equals(k)) {
+                    transportId = v;
+                }
+            }
+            result.add(new AdbDeviceInfo(serial, state, model, product, device, usb, transportId));
+        }
+        return result;
+    }
+
+    /**
+     * Resolves a single online ADB serial for a peer discovered via mDNS/QR/direct IP when
+     * no explicit {@code -s <serial>} was supplied.
+     */
+    public static String selectBestSerialForPeer(List<AdbDeviceInfo> devices, String preferredDeviceName) {
+        if (devices == null || devices.isEmpty()) {
+            return null;
+        }
+        List<AdbDeviceInfo> online = new ArrayList<>();
+        for (AdbDeviceInfo d : devices) {
+            if (d != null && d.isOnline() && d.serial != null && !d.serial.isEmpty()) {
+                online.add(d);
+            }
+        }
+        if (online.isEmpty()) {
+            return null;
+        }
+        if (online.size() == 1) {
+            return online.get(0).serial;
+        }
+
+        if (preferredDeviceName != null && !preferredDeviceName.trim().isEmpty()) {
+            String targetNorm = normalizeModelToken(preferredDeviceName);
+            if (!targetNorm.isEmpty()) {
+                List<AdbDeviceInfo> exactMatches = new ArrayList<>();
+                List<AdbDeviceInfo> partialMatches = new ArrayList<>();
+                for (AdbDeviceInfo d : online) {
+                    String modelNorm = normalizeModelToken(d.model);
+                    String productNorm = normalizeModelToken(d.product);
+                    String deviceNorm = normalizeModelToken(d.device);
+                    if (targetNorm.equals(modelNorm) || targetNorm.equals(productNorm) || targetNorm.equals(deviceNorm)) {
+                        exactMatches.add(d);
+                    } else if ((!modelNorm.isEmpty() && (modelNorm.contains(targetNorm) || targetNorm.contains(modelNorm)))
+                            || (!productNorm.isEmpty() && (productNorm.contains(targetNorm) || targetNorm.contains(productNorm)))) {
+                        partialMatches.add(d);
+                    }
+                }
+                List<AdbDeviceInfo> matches = !exactMatches.isEmpty() ? exactMatches : partialMatches;
+                if (matches.size() == 1) {
+                    return matches.get(0).serial;
+                }
+                if (matches.size() > 1) {
+                    List<AdbDeviceInfo> usbMatches = filterPhysicalUsb(matches);
+                    if (usbMatches.size() == 1) {
+                        return usbMatches.get(0).serial;
+                    }
+                }
+            }
+        }
+
+        List<AdbDeviceInfo> usbOnly = filterPhysicalUsb(online);
+        if (usbOnly.size() == 1) {
+            return usbOnly.get(0).serial;
+        }
+        return null;
+    }
+
+    private static List<AdbDeviceInfo> filterPhysicalUsb(List<AdbDeviceInfo> devices) {
+        List<AdbDeviceInfo> out = new ArrayList<>();
+        for (AdbDeviceInfo d : devices) {
+            if (d.isPhysicalUsb()) {
+                out.add(d);
+            }
+        }
+        return out;
+    }
+
+    private static String normalizeModelToken(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(raw.length());
+        for (int i = 0; i < raw.length(); i++) {
+            char c = raw.charAt(i);
+            if (Character.isLetterOrDigit(c)) {
+                sb.append(Character.toLowerCase(c));
+            }
+        }
+        return sb.toString();
+    }
+
     static boolean isOfflineError(CommandResult res) {
         if (res == null || res.isSuccess()) {
             return false;
         }
         String combined = (res.stderr + "\n" + res.stdout).toLowerCase(Locale.ROOT);
         return combined.contains("device offline") || combined.contains("offline");
+    }
+
+    static boolean isPortRebindError(CommandResult res) {
+        if (res == null || res.isSuccess()) {
+            return false;
+        }
+        String combined = (res.stderr + "\n" + res.stdout).toLowerCase(Locale.ROOT);
+        return combined.contains("cannot rebind")
+                || combined.contains("cannot bind listener")
+                || combined.contains("address already in use");
     }
 
     static boolean isRecoverableTransportError(CommandResult res) {
@@ -647,6 +839,85 @@ public class AdbManager implements AutoCloseable {
                 || combined.contains("closed")
                 || combined.contains("timed out")
                 || combined.contains("not found");
+    }
+
+    /**
+     * Resolves an attached ADB device for a peer discovered via mDNS/QR/direct IP and establishes
+     * {@code adb -s <serial> forward tcp:<localPort> tcp:<remotePort>}.
+     *
+     * <p>Avoids bare {@code adb forward} failures when multiple devices/emulators or stale offline
+     * entries exist alongside the wired phone, while keeping explicit {@code -s <serial>} intact.</p>
+     */
+    public ForwardResult forwardPortForPeer(int localPort,
+                                            int remotePort,
+                                            String explicitSerial,
+                                            String preferredDeviceName) {
+        if (explicitSerial != null && !explicitSerial.trim().isEmpty()) {
+            return forwardPort(localPort, remotePort, explicitSerial.trim());
+        }
+
+        AdbCandidate selected = selectBestCandidate();
+        if (selected == null) {
+            IpcDtos.AdbCapabilityInfo cap = probe(null);
+            return new ForwardResult(false, localPort, remotePort, null, "",
+                    cap.warning != null ? cap.warning : "adb not available", cap);
+        }
+
+        ProcessEnvSpec envSpec = buildProcessEnvironment();
+        long queryTimeout = Math.min(config.commandTimeoutMs, 3_000L);
+        List<AdbDeviceInfo> devices = listDevicesLong(selected.path, envSpec, queryTimeout);
+
+        boolean hasOnline = false;
+        boolean hasOffline = false;
+        for (AdbDeviceInfo d : devices) {
+            if (d.isOnline()) {
+                hasOnline = true;
+            } else if (d.isOffline()) {
+                hasOffline = true;
+            }
+        }
+        if (!hasOnline && hasOffline && config.autoRecoverOfflineDevice) {
+            if (recoverOfflineTransport(selected.path, null, envSpec, true)) {
+                devices = listDevicesLong(selected.path, envSpec, queryTimeout);
+            }
+        }
+
+        List<AdbDeviceInfo> onlineDevices = new ArrayList<>();
+        for (AdbDeviceInfo d : devices) {
+            if (d.isOnline()) {
+                onlineDevices.add(d);
+            }
+        }
+        if (onlineDevices.isEmpty()) {
+            IpcDtos.AdbCapabilityInfo cap = new IpcDtos.AdbCapabilityInfo();
+            cap.available = true;
+            cap.adbPath = selected.path;
+            cap.version = selected.version.raw;
+            cap.burstModeEnvInjected = !config.adbLegacy && (config.injectLibusb || config.injectBurstMode);
+            cap.recommendedStreams = computeRecommendedStreams(false, false);
+            return new ForwardResult(false, localPort, remotePort, null, "",
+                    "No online ADB device attached", cap);
+        }
+
+        String resolvedSerial = selectBestSerialForPeer(onlineDevices, preferredDeviceName);
+        if (resolvedSerial == null) {
+            StringBuilder serials = new StringBuilder();
+            for (int i = 0; i < onlineDevices.size(); i++) {
+                if (i > 0) serials.append(", ");
+                serials.append(onlineDevices.get(i).serial);
+            }
+            IpcDtos.AdbCapabilityInfo cap = new IpcDtos.AdbCapabilityInfo();
+            cap.available = true;
+            cap.adbPath = selected.path;
+            cap.version = selected.version.raw;
+            cap.burstModeEnvInjected = !config.adbLegacy && (config.injectLibusb || config.injectBurstMode);
+            cap.recommendedStreams = computeRecommendedStreams(false, false);
+            return new ForwardResult(false, localPort, remotePort, null, "",
+                    "Multiple online ADB devices attached (" + serials + "); specify -s <serial> or uncheck USB_ADB",
+                    cap);
+        }
+
+        return forwardPort(localPort, remotePort, resolvedSerial);
     }
 
     /**
@@ -673,6 +944,15 @@ public class AdbManager implements AutoCloseable {
         try {
             CommandResult res = commandExecutor.execute(
                     cmd, envSpec, config.workingDirectory, config.commandTimeoutMs);
+
+            if (!res.isSuccess() && isPortRebindError(res)) {
+                executeRemoveForward(cap.adbPath, localPort, serial, config.cleanupTimeoutMs);
+                if (serial != null && !serial.isEmpty()) {
+                    executeRemoveForward(cap.adbPath, localPort, null, config.cleanupTimeoutMs);
+                }
+                res = commandExecutor.execute(
+                        cmd, envSpec, config.workingDirectory, config.commandTimeoutMs);
+            }
 
             if (!res.isSuccess() && config.autoRecoverOfflineDevice && isRecoverableTransportError(res)) {
                 boolean offlineDetected = isOfflineError(res);
@@ -808,6 +1088,25 @@ public class AdbManager implements AutoCloseable {
                 Thread.currentThread().interrupt();
             }
             return new CommandResult(-1, "", e.getMessage());
+        }
+    }
+
+    private List<AdbDeviceInfo> listDevicesLong(String adbPath, ProcessEnvSpec envSpec, long timeoutMs) {
+        List<String> cmd = new ArrayList<>(3);
+        cmd.add(adbPath);
+        cmd.add("devices");
+        cmd.add("-l");
+        try {
+            CommandResult res = commandExecutor.execute(cmd, envSpec, config.workingDirectory, timeoutMs);
+            if (!res.isSuccess()) {
+                return Collections.emptyList();
+            }
+            return parseDevicesLongOutput(res.stdout);
+        } catch (IOException | InterruptedException e) {
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            return Collections.emptyList();
         }
     }
 

@@ -148,12 +148,17 @@ public static class Program
                     await bridge.CallAsync("session.connect", new
                     {
                         mode = "auto",
+                        serial,
                         homeDir
                     }, exitCts.Token);
                     Console.WriteLine("[HybridFileXfer] Connected automatically to trusted device!");
                 }
-                catch
+                catch (Exception ex)
                 {
+                    if (!ex.Message.Contains("No trusted peer discovered", StringComparison.OrdinalIgnoreCase))
+                    {
+                        Console.Error.WriteLine($"[WARN] Auto-connect failed: {ex.Message}");
+                    }
                     Console.WriteLine("[HybridFileXfer] No trusted device discovered nearby; launching QR pairing...");
                     await StartQrPairingAsync(bridge, exitCts.Token);
                 }
@@ -302,6 +307,15 @@ public static class Program
                 var name = payload.TryGetProperty("deviceName", out var n) ? n.GetString() ?? "Peer" : "Peer";
                 var trusted = payload.TryGetProperty("trusted", out var t) && t.GetBoolean();
                 Console.WriteLine($"[mDNS] Discovered {name} (trusted={trusted})");
+                break;
+            }
+
+            case "adb.version_warning":
+            case "diagnostic.warning":
+            {
+                var code = payload.TryGetProperty("code", out var c) ? c.GetString() ?? eventName : eventName;
+                var msg = payload.TryGetProperty("message", out var m) ? m.GetString() ?? "" : "";
+                Console.Error.WriteLine($"[WARN][{code}] {msg}");
                 break;
             }
         }

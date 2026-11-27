@@ -392,7 +392,12 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 Toast.makeText(context, R.string.xu_yao_wen_jian_du_xie_quan_xian, Toast.LENGTH_LONG).show();
                 return true;
             }
-            startActivity(new Intent(context, QrScanActivity.class));
+            Intent scanIntent = new Intent(context, QrScanActivity.class);
+            List<IpcDtos.RailSelection> selectedRails = netCardsAdapter.getSelectedRailSelections();
+            if (selectedRails != null && !selectedRails.isEmpty()) {
+                scanIntent.putExtra(QrScanActivity.EXTRA_SELECTED_RAILS_JSON, IpcJson.toJson(selectedRails));
+            }
+            startActivity(scanIntent);
             overridePendingTransition(R.anim.hfx_slide_in_right, R.anim.hfx_fade_out);
             return true;
         } else if (itemId == R.id.github) {

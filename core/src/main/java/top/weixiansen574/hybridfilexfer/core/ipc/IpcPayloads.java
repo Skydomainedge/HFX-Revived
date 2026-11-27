@@ -21,6 +21,7 @@ public final class IpcPayloads {
 
     public static class PairSubmitUriParams {
         public String uri;
+        public List<IpcDtos.RailSelection> selectedRails;
     }
 
     public static class PeerRemoveParams {

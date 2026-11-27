@@ -181,10 +181,13 @@ public abstract class AbstractHFXServer extends HFXService {
                         ? ProtocolConstants.clampBlockSize(preferredBlockSize)
                         : ProtocolConstants.DEFAULT_BLOCK_SIZE;
 
-                int[] effectiveStreamCounts = new int[interfaceList.size()];
+                boolean excludeAdbRail = (clientCaps & ProtocolConstants.CAP_EXCLUDE_ADB_RAIL) != 0;
+                List<ServerNetInterface> sessionInterfaces = filterSessionInterfaces(interfaceList, excludeAdbRail);
+
+                int[] effectiveStreamCounts = new int[sessionInterfaces.size()];
                 int totalStreams = 0;
-                for (int i = 0; i < interfaceList.size(); i++) {
-                    ServerNetInterface rail = interfaceList.get(i);
+                for (int i = 0; i < sessionInterfaces.size(); i++) {
+                    ServerNetInterface rail = sessionInterfaces.get(i);
                     int sc = rail.streamCount;
                     if (rail.railType == RailType.ADB && requestedAdbStreams > 0) {
                         sc = ProtocolConstants.clampStreamCount(requestedAdbStreams);
@@ -198,9 +201,9 @@ public abstract class AbstractHFXServer extends HFXService {
                 // Write sessionToken + blockSize + rail list
                 ctrl.write(sessionToken);
                 ctrl.writeInt(chosenBlockSize);
-                ctrl.writeInt(interfaceList.size());
-                for (int i = 0; i < interfaceList.size(); i++) {
-                    ServerNetInterface netInterface = interfaceList.get(i);
+                ctrl.writeInt(sessionInterfaces.size());
+                for (int i = 0; i < sessionInterfaces.size(); i++) {
+                    ServerNetInterface netInterface = sessionInterfaces.get(i);
                     byte[] address = netInterface.address.getAddress();
                     ctrl.writeUTF(netInterface.name);
                     ctrl.writeByte(netInterface.railType.code);
@@ -217,7 +220,7 @@ public abstract class AbstractHFXServer extends HFXService {
                 }
 
                 List<TransferConnection> dataConns = acceptDataChannelsParallel(
-                        ssc, controlSocket, ctrl, interfaceList, effectiveStreamCounts,
+                        ssc, controlSocket, ctrl, sessionInterfaces, effectiveStreamCounts,
                         totalStreams, sessionToken, callback);
                 if (dataConns == null) {
                     closeQuietly(ctrl);
@@ -239,6 +242,7 @@ public abstract class AbstractHFXServer extends HFXService {
                 }
                 ctrl.writeBoolean(true);
 
+                this.activeRails = Collections.unmodifiableList(new ArrayList<>(sessionInterfaces));
                 this.negotiatedCapabilities = negCaps;
                 this.negotiatedBlockSize = chosenBlockSize;
                 this.connectedClientId = clientId;
@@ -476,27 +480,37 @@ public abstract class AbstractHFXServer extends HFXService {
                 }
                 selector.select(Math.min(remaining, 250));
                 Set<SelectionKey> keys = selector.selectedKeys();
+                // Always check controlSocket abort/disconnect BEFORE accepting new sockets on ssc,
+                // so a rapid fallback retry connection queued on ssc is never consumed as a stale HFXD stream.
+                boolean controlAborted = false;
+                for (SelectionKey key : keys) {
+                    if (key.isValid() && key.isReadable() && key.channel() == controlSocket) {
+                        controlAborted = true;
+                        break;
+                    }
+                }
+                if (controlAborted) {
+                    keys.clear();
+                    closeSlots(slots);
+                    restoreBlocking(ssc, controlSocket, selector);
+                    String failedName = "aborted";
+                    try {
+                        boolean ok = ctrl.readBoolean();
+                        if (!ok) {
+                            failedName = ctrl.readUTF();
+                        }
+                    } catch (IOException ignored) {
+                    }
+                    callback.onAcceptFailed(failedName);
+                    return null;
+                }
+
                 Iterator<SelectionKey> it = keys.iterator();
                 while (it.hasNext()) {
                     SelectionKey key = it.next();
                     it.remove();
                     if (!key.isValid()) {
                         continue;
-                    }
-                    if (key.isReadable() && key.channel() == controlSocket) {
-                        // Control channel became readable before all data streams registered -> client aborted or dropped
-                        closeSlots(slots);
-                        restoreBlocking(ssc, controlSocket, selector);
-                        String failedName = "aborted";
-                        try {
-                            boolean ok = ctrl.readBoolean();
-                            if (!ok) {
-                                failedName = ctrl.readUTF();
-                            }
-                        } catch (IOException ignored) {
-                        }
-                        callback.onAcceptFailed(failedName);
-                        return null;
                     }
                     if (key.isAcceptable() && key.channel() == ssc) {
                         SocketChannel dataSc = ssc.accept();
@@ -555,6 +569,25 @@ public abstract class AbstractHFXServer extends HFXService {
             }
         }
         return ordered;
+    }
+
+    private static List<ServerNetInterface> filterSessionInterfaces(List<ServerNetInterface> interfaceList,
+                                                                    boolean excludeAdbRail) {
+        if (!excludeAdbRail || interfaceList == null || interfaceList.size() <= 1) {
+            return interfaceList;
+        }
+        List<ServerNetInterface> nonAdb = new ArrayList<>(interfaceList.size());
+        for (ServerNetInterface rail : interfaceList) {
+            if (rail == null) {
+                continue;
+            }
+            boolean isAdb = rail.railType == RailType.ADB
+                    || ProtocolConstants.USB_ADB_RAIL_NAME.equalsIgnoreCase(rail.name);
+            if (!isAdb) {
+                nonAdb.add(rail);
+            }
+        }
+        return nonAdb.isEmpty() ? interfaceList : nonAdb;
     }
 
     private static void restoreBlocking(ServerSocketChannel ssc, SocketChannel controlSocket, Selector selector) {

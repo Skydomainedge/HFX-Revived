@@ -40,8 +40,10 @@ import com.google.zxing.common.HybridBinarizer;
 import com.google.zxing.qrcode.QRCodeReader;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -49,6 +51,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 import top.weixiansen574.hybridfilexfer.aidl.IHfxEngine;
 import top.weixiansen574.hybridfilexfer.aidl.IHfxEngineCallback;
+import top.weixiansen574.hybridfilexfer.core.ipc.IpcDtos;
 import top.weixiansen574.hybridfilexfer.core.ipc.IpcEvents;
 import top.weixiansen574.hybridfilexfer.core.ipc.IpcJson;
 import top.weixiansen574.hybridfilexfer.core.ipc.IpcMethods;
@@ -64,6 +67,8 @@ import top.weixiansen574.hybridfilexfer.engine.HfxEngineService;
  * clearly perceives the result, and smoothly returns to {@link MainActivity}.</p>
  */
 public class QrScanActivity extends AppCompatActivity implements ServiceConnection {
+
+    public static final String EXTRA_SELECTED_RAILS_JSON = "selected_rails_json";
 
     private static final int REQUEST_CAMERA_PERMISSION = 201;
     private static final long REACTION_WINDOW_MS = 1150L;
@@ -86,6 +91,7 @@ public class QrScanActivity extends AppCompatActivity implements ServiceConnecti
     private IHfxEngine engine;
     private boolean engineBound = false;
     private String pendingUriToSubmit;
+    private List<IpcDtos.RailSelection> selectedRails;
 
     private final IHfxEngineCallback engineCallback = new IHfxEngineCallback.Stub() {
         @Override
@@ -116,6 +122,18 @@ public class QrScanActivity extends AppCompatActivity implements ServiceConnecti
         statusSubtitle = findViewById(R.id.qr_status_subtitle);
         hintText = findViewById(R.id.qr_hint_text);
         findViewById(R.id.btn_qr_back).setOnClickListener(v -> finishWithTransition());
+
+        String selectedRailsJson = getIntent().getStringExtra(EXTRA_SELECTED_RAILS_JSON);
+        if (selectedRailsJson != null && !selectedRailsJson.trim().isEmpty()) {
+            try {
+                IpcDtos.RailSelection[] parsedRails = IpcJson.fromJson(
+                        selectedRailsJson, IpcDtos.RailSelection[].class);
+                if (parsedRails != null && parsedRails.length > 0) {
+                    this.selectedRails = Arrays.asList(parsedRails);
+                }
+            } catch (Exception ignored) {
+            }
+        }
 
         qrCodeReader = new QRCodeReader();
         decodeHints = new EnumMap<>(DecodeHintType.class);
@@ -321,6 +339,7 @@ public class QrScanActivity extends AppCompatActivity implements ServiceConnecti
             try {
                 IpcPayloads.PairSubmitUriParams params = new IpcPayloads.PairSubmitUriParams();
                 params.uri = rawUri;
+                params.selectedRails = this.selectedRails;
                 eng.executeCommand(IpcMethods.PAIR_SUBMIT_QR_URI, IpcJson.toJson(params));
             } catch (Exception ignored) {
             }

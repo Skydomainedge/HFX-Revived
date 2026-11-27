@@ -17,8 +17,14 @@ import top.weixiansen574.hybridfilexfer.core.protocol.RailType;
 import top.weixiansen574.hybridfilexfer.pc.engine.transport.SubnetBindResolver;
 
 public class JdkHFXClient extends HFXClient {
+    @FunctionalInterface
+    public interface AdbRailPreparer {
+        AdbRailPrepareResult prepare(List<ServerNetInterface> rails);
+    }
+
     private SubnetBindResolver subnetBindResolver;
     private boolean autoSubnetBindEnabled = true;
+    private AdbRailPreparer adbRailPreparer;
 
     public JdkHFXClient(String serverControllerAddress, int serverPort, String homeDir) {
         this(serverControllerAddress, serverPort, homeDir, new SubnetBindResolver());
@@ -40,6 +46,28 @@ public class JdkHFXClient extends HFXClient {
 
     public boolean isAutoSubnetBindEnabled() {
         return autoSubnetBindEnabled;
+    }
+
+    public void setAdbRailPreparer(AdbRailPreparer adbRailPreparer) {
+        this.adbRailPreparer = adbRailPreparer;
+    }
+
+    @Override
+    protected InetAddress resolveControlBindAddress(InetAddress controlAddress) {
+        if (!autoSubnetBindEnabled || subnetBindResolver == null
+                || controlAddress == null || controlAddress.isLoopbackAddress()) {
+            return null;
+        }
+        return subnetBindResolver.resolveLocalBindAddress(controlAddress);
+    }
+
+    @Override
+    protected AdbRailPrepareResult prepareAdbRailBeforeDataConnect(List<ServerNetInterface> rails) {
+        AdbRailPreparer preparer = this.adbRailPreparer;
+        if (preparer != null) {
+            return preparer.prepare(rails);
+        }
+        return super.prepareAdbRailBeforeDataConnect(rails);
     }
 
     @Override

@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -29,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import top.weixiansen574.hybridfilexfer.core.AbstractHFXServer;
@@ -56,6 +58,7 @@ import top.weixiansen574.hybridfilexfer.core.protocol.SessionAuthProvider;
 import top.weixiansen574.hybridfilexfer.jdkcore.JdkReadFileCall;
 import top.weixiansen574.hybridfilexfer.jdkcore.JdkWriteFileCall;
 import top.weixiansen574.hybridfilexfer.pc.engine.PcEngineRuntime;
+import top.weixiansen574.hybridfilexfer.pc.engine.adb.AdbManager;
 import top.weixiansen574.hybridfilexfer.pc.engine.ipc.JsonRpcDispatcher;
 
 import static org.junit.Assert.assertEquals;
@@ -129,11 +132,13 @@ public class PairingAndAutoConnectE2ETest {
         final CountDownLatch authFailed = new CountDownLatch(1);
 
         RunningAuthMobileServer() throws Exception {
+            this(Collections.singletonList(
+                    new ServerNetInterface("wlan0", InetAddress.getByName("127.0.0.1"), null, RailType.WIFI, 1)));
+        }
+
+        RunningAuthMobileServer(List<ServerNetInterface> rails) throws Exception {
             server.setPreferredBlockSize(256 * 1024);
             server.setAuthProvider(auth);
-            InetAddress loopback = InetAddress.getByName("127.0.0.1");
-            List<ServerNetInterface> rails = Collections.singletonList(
-                    new ServerNetInterface("wlan0", loopback, null, RailType.WIFI, 1));
             exec.submit(() -> {
                 try {
                     server.startServer(0, rails, 16, 16, new ServerHandshakeCallback() {
@@ -407,6 +412,210 @@ public class PairingAndAutoConnectE2ETest {
             assertTrue("pair.expired event must fire after TTL", expiredLatch.await(4, TimeUnit.SECONDS));
             assertFalse("PNG must be deleted on expiry", Files.exists(png2));
             assertEquals(SessionState.IDLE, pc.getState());
+        }
+    }
+
+    @Test
+    public void testWiredMdnsAndQrPairingWithAdbCheckedSetsUpOnDemandAdbForwardAndCleansUp() throws Exception {
+        Path storeFile = tempFolder.newFolder("wired_adb_store").toPath().resolve("trusted_peers.json");
+        Path qrDir = tempFolder.newFolder("wired_adb_qr").toPath();
+        java.io.File fakeAdb = tempFolder.newFile("adb_wired.exe");
+        final String phoneId = "oneplus13-wired-adb";
+        final String phoneName = "PJZ110";
+
+        AtomicInteger forwardAddCount = new AtomicInteger(0);
+        AtomicInteger forwardRemoveCount = new AtomicInteger(0);
+        AtomicReference<String> forwardedSerial = new AtomicReference<>();
+
+        AdbManager.CommandExecutor fakeExec = (cmd, envSpec, wd, timeoutMs) -> {
+            if (cmd.contains("version")) {
+                return new AdbManager.CommandResult(0, "Version 36.0.0-13206524\n", "");
+            }
+            if (cmd.contains("devices")) {
+                return new AdbManager.CommandResult(0,
+                        "List of devices attached\n"
+                                + "emulator-5554          device product:sdk model:sdk_gphone64 transport_id:1\n"
+                                + "3B15B100P8E00000       device product:PJZ110 model:PJZ110 transport_id:3\n", "");
+            }
+            if (cmd.contains("host-features") || cmd.contains("features")) {
+                return new AdbManager.CommandResult(0, "shell_v2,libusb,delayed_ack\n", "");
+            }
+            if (cmd.contains("forward") && cmd.contains("--remove")) {
+                forwardRemoveCount.incrementAndGet();
+                return new AdbManager.CommandResult(0, "", "");
+            }
+            if (cmd.contains("forward")) {
+                int sIdx = cmd.indexOf("-s");
+                if (sIdx >= 0 && sIdx + 1 < cmd.size()) {
+                    forwardedSerial.set(cmd.get(sIdx + 1));
+                }
+                forwardAddCount.incrementAndGet();
+                return new AdbManager.CommandResult(0, "5740\n", "");
+            }
+            return new AdbManager.CommandResult(0, "", "");
+        };
+        AdbManager.EnvironmentProvider fakeEnv = new AdbManager.EnvironmentProvider() {
+            @Override public String getEnv(String name) { return null; }
+            @Override public boolean isWindows() { return true; }
+            @Override public String getPathSeparator() { return ";"; }
+            @Override public boolean isExecutableFile(java.io.File file) {
+                return file.getAbsolutePath().equals(fakeAdb.getAbsolutePath());
+            }
+            @Override public String canonicalizePath(java.io.File file) { return file.getAbsolutePath(); }
+        };
+
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        List<ServerNetInterface> mobileRails = Arrays.asList(
+                new ServerNetInterface("rndis0", loopback, null, RailType.USB_NIC, 1),
+                new ServerNetInterface("wlan0", loopback, null, RailType.WIFI, 1),
+                new ServerNetInterface(ProtocolConstants.USB_ADB_RAIL_NAME, loopback, null, RailType.ADB, 1)
+        );
+
+        PcEngineRuntime.EngineConfig cfg = new PcEngineRuntime.EngineConfig();
+        cfg.trustedPeersPath = storeFile;
+        cfg.qrTempDir = qrDir;
+        cfg.preferredPairPort = 0;
+        cfg.enableMdns = false;
+        cfg.autoConnectOnPair = true;
+        cfg.autoConnectDiscoveryWaitMs = 1500L;
+        cfg.defaultAutoSubnetBind = false;
+        cfg.enableOnDemandAdbOnLoopbackForTest = true;
+        cfg.adbConfig.explicitAdbPath = fakeAdb.getAbsolutePath();
+        cfg.overrideQrCandidateIps = Collections.singletonList("127.0.0.1");
+
+        // 1) QR pairing with USB_ADB + rndis0 + wlan0 all checked on mobile
+        byte[] derivedSecret;
+        String pcId;
+        try (RunningAuthMobileServer mobile = new RunningAuthMobileServer(mobileRails);
+             PcEngineRuntime pc = new PcEngineRuntime(cfg, null, null,
+                     (adbCfg, listener) -> new AdbManager(adbCfg, fakeExec, fakeEnv, listener))) {
+            pcId = pc.getDeviceId();
+            CountDownLatch connectedLatch = new CountDownLatch(1);
+            pc.addEventListener((ev, payload) -> {
+                if (IpcEvents.SESSION_STATE_CHANGED.equals(ev)
+                        && ((IpcPayloads.SessionStateChangedPayload) payload).current == SessionState.CONNECTED) {
+                    connectedLatch.countDown();
+                }
+            });
+
+            IpcPayloads.PairQrReadyPayload qr = pc.startQrPairing(new IpcPayloads.PairStartParams());
+            PairUriCodec.PairPayload parsed = PairUriCodec.decode(qr.pairUri);
+            derivedSecret = HmacAuth.derivePairSecret(parsed.token, parsed.pcId, phoneId);
+            mobile.auth.secrets.put(parsed.pcId, derivedSecret);
+
+            HttpCallbackResult httpRes = sendPairHttpCallback(parsed, phoneId, phoneName, mobile.port(), null);
+            assertEquals(200, httpRes.statusCode);
+            assertTrue("QR auto-connect with USB_ADB + rndis0 + wlan0 must succeed",
+                    connectedLatch.await(5, TimeUnit.SECONDS));
+            assertEquals(SessionState.CONNECTED, pc.getState());
+            assertEquals("Must lazily invoke adb forward for USB_ADB rail", 1, forwardAddCount.get());
+            assertEquals("Must match wired phone serial by model PJZ110", "3B15B100P8E00000", forwardedSerial.get());
+            assertEquals(Arrays.asList("rndis0", "wlan0", ProtocolConstants.USB_ADB_RAIL_NAME),
+                    mobile.server.getDistinctRailNames());
+
+            pc.disconnect();
+            assertEquals("Disconnect must clean up lazily created adb forward", 1, forwardRemoveCount.get());
+        }
+
+        // 2) Restarted mDNS auto-connect with USB_ADB + rndis0 + wlan0 all checked on mobile
+        try (RunningAuthMobileServer mobile2 = new RunningAuthMobileServer(mobileRails);
+             PcEngineRuntime pc2 = new PcEngineRuntime(cfg, null, null,
+                     (adbCfg, listener) -> new AdbManager(adbCfg, fakeExec, fakeEnv, listener))) {
+            mobile2.auth.secrets.put(pcId, derivedSecret);
+            pc2.getMdnsManager().handleServiceResolved(new MdnsManager.ObservedService(
+                    "127.0.0.1", "HFX-op13", phoneId, phoneName,
+                    Collections.singletonList("127.0.0.1"), mobile2.port(), "rndis0", null));
+
+            IpcPayloads.SessionConnectParams autoParams = new IpcPayloads.SessionConnectParams();
+            autoParams.mode = "auto";
+            autoParams.autoSubnetBind = false;
+            assertTrue("mDNS auto-connect with USB_ADB checked must succeed", pc2.connect(autoParams).ok);
+            assertEquals(SessionState.CONNECTED, pc2.getState());
+            assertEquals(2, forwardAddCount.get());
+            assertEquals(Arrays.asList("rndis0", "wlan0", ProtocolConstants.USB_ADB_RAIL_NAME),
+                    mobile2.server.getDistinctRailNames());
+
+            pc2.disconnect();
+            assertEquals(2, forwardRemoveCount.get());
+        }
+    }
+
+    @Test
+    public void testMdnsAutoConnectWithAdbCheckedFallsBackToRndisAndWifiWhenAdbUnavailable() throws Exception {
+        Path storeFile = tempFolder.newFolder("fallback_adb_store").toPath().resolve("trusted_peers.json");
+        Path qrDir = tempFolder.newFolder("fallback_adb_qr").toPath();
+        java.io.File fakeAdb = tempFolder.newFile("adb_empty.exe");
+        final String phoneId = "oneplus13-no-adb";
+        final String phoneName = "PJZ110";
+
+        AdbManager.CommandExecutor noDeviceExec = (cmd, envSpec, wd, timeoutMs) -> {
+            if (cmd.contains("version")) {
+                return new AdbManager.CommandResult(0, "Version 36.0.0-13206524\n", "");
+            }
+            if (cmd.contains("devices")) {
+                return new AdbManager.CommandResult(0, "List of devices attached\n\n", "");
+            }
+            return new AdbManager.CommandResult(1, "", "error: no devices/emulators found");
+        };
+        AdbManager.EnvironmentProvider fakeEnv = new AdbManager.EnvironmentProvider() {
+            @Override public String getEnv(String name) { return null; }
+            @Override public boolean isWindows() { return true; }
+            @Override public String getPathSeparator() { return ";"; }
+            @Override public boolean isExecutableFile(java.io.File file) {
+                return file.getAbsolutePath().equals(fakeAdb.getAbsolutePath());
+            }
+            @Override public String canonicalizePath(java.io.File file) { return file.getAbsolutePath(); }
+        };
+
+        InetAddress loopback = InetAddress.getByName("127.0.0.1");
+        List<ServerNetInterface> mobileRails = Arrays.asList(
+                new ServerNetInterface("rndis0", loopback, null, RailType.USB_NIC, 1),
+                new ServerNetInterface("wlan0", loopback, null, RailType.WIFI, 1),
+                new ServerNetInterface(ProtocolConstants.USB_ADB_RAIL_NAME, loopback, null, RailType.ADB, 1)
+        );
+
+        PcEngineRuntime.EngineConfig cfg = new PcEngineRuntime.EngineConfig();
+        cfg.trustedPeersPath = storeFile;
+        cfg.qrTempDir = qrDir;
+        cfg.preferredPairPort = 0;
+        cfg.enableMdns = false;
+        cfg.autoConnectDiscoveryWaitMs = 1500L;
+        cfg.defaultAutoSubnetBind = false;
+        cfg.enableOnDemandAdbOnLoopbackForTest = true;
+        cfg.adbConfig.explicitAdbPath = fakeAdb.getAbsolutePath();
+
+        try (RunningAuthMobileServer mobile = new RunningAuthMobileServer(mobileRails);
+             PcEngineRuntime pc = new PcEngineRuntime(cfg, null, null,
+                     (adbCfg, listener) -> new AdbManager(adbCfg, noDeviceExec, fakeEnv, listener))) {
+            byte[] secret = HmacAuth.generateRandomBytes(32);
+            pc.getTrustedPeerStore().upsertPeer(phoneId, phoneName, secret,
+                    Collections.singletonList("127.0.0.1"), mobile.port(), "rndis0");
+            mobile.auth.secrets.put(pc.getDeviceId(), secret);
+
+            CopyOnWriteArrayList<String> warningCodes = new CopyOnWriteArrayList<>();
+            pc.addEventListener((ev, payload) -> {
+                if (IpcEvents.DIAGNOSTIC_WARNING.equals(ev)
+                        && payload instanceof IpcPayloads.DiagnosticWarningPayload) {
+                    warningCodes.add(((IpcPayloads.DiagnosticWarningPayload) payload).code);
+                }
+            });
+
+            pc.getMdnsManager().handleServiceResolved(new MdnsManager.ObservedService(
+                    "127.0.0.1", "HFX-no-adb", phoneId, phoneName,
+                    Collections.singletonList("127.0.0.1"), mobile.port(), "rndis0", null));
+
+            IpcPayloads.SessionConnectParams autoParams = new IpcPayloads.SessionConnectParams();
+            autoParams.mode = "auto";
+            autoParams.autoSubnetBind = false;
+            assertTrue("Must succeed via automatic CAP_EXCLUDE_ADB_RAIL fallback", pc.connect(autoParams).ok);
+            assertEquals(SessionState.CONNECTED, pc.getState());
+            assertTrue("Must emit ADB_RAIL_SKIPPED_FALLBACK warning",
+                    warningCodes.contains("ADB_RAIL_SKIPPED_FALLBACK"));
+            assertEquals(Arrays.asList("rndis0", "wlan0"), mobile.server.getDistinctRailNames());
+
+            // Also verify MdnsManager ranks real IP ahead of loopback 127.0.0.1
+            List<String> ranked = pc.getMdnsManager().rankPeerIps(Arrays.asList("127.0.0.1", "10.94.81.247"));
+            assertEquals("10.94.81.247", ranked.get(0));
         }
     }
 

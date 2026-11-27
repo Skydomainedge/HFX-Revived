@@ -329,6 +329,24 @@ public class PairingServer implements AutoCloseable {
                     peerIps.add(remoteIp);
                 }
             }
+            // Strip mobile's 127.0.0.1 placeholder (e.g. when only USB_ADB was checked) if real
+            // USB-NIC / LAN remote IPs exist, while preserving 127.0.0.1 in pure loopback tests.
+            boolean hasNonLoopbackIp = false;
+            for (String ip : peerIps) {
+                if (!isLoopbackLiteral(ip)) {
+                    hasNonLoopbackIp = true;
+                    break;
+                }
+            }
+            if (hasNonLoopbackIp) {
+                List<String> filtered = new ArrayList<>(peerIps.size());
+                for (String ip : peerIps) {
+                    if (!isLoopbackLiteral(ip)) {
+                        filtered.add(ip);
+                    }
+                }
+                peerIps = filtered;
+            }
 
             IpcDtos.PeerInfo peer = new IpcDtos.PeerInfo();
             peer.deviceId = deviceId;
@@ -403,6 +421,15 @@ public class PairingServer implements AutoCloseable {
             } catch (IOException ignored) {
             }
         }
+    }
+
+    private static boolean isLoopbackLiteral(String ip) {
+        if (ip == null) {
+            return false;
+        }
+        String trimmed = ip.trim().toLowerCase(Locale.ROOT);
+        return trimmed.startsWith("127.") || "::1".equals(trimmed) || "0:0:0:0:0:0:0:1".equals(trimmed)
+                || "localhost".equals(trimmed);
     }
 
     private static boolean constantTimeEquals(String a, String b) {

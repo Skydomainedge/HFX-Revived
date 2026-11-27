@@ -33,6 +33,13 @@ public final class ProtocolConstants {
     public static final int CAP_AUTH_HMAC = 1 << 1;
     public static final int CAP_V4_FRAME_COALESCE = 1 << 2;
     public static final int CAP_DYNAMIC_BLOCK = 1 << 3;
+    /**
+     * Client-advisory capability bit sent on fallback retry when a PC direct/mDNS connection
+     * cannot establish an ADB port forward for {@link RailType#ADB}. Servers supporting this flag
+     * omit ADB rails when at least one non-ADB rail is available. Backward-compatible with v400
+     * servers, which mask {@code clientCaps & ALL_V4_CAPS}.
+     */
+    public static final int CAP_EXCLUDE_ADB_RAIL = 1 << 4;
     public static final int ALL_V4_CAPS =
             CAP_MULTI_STREAM | CAP_AUTH_HMAC | CAP_V4_FRAME_COALESCE | CAP_DYNAMIC_BLOCK;
 

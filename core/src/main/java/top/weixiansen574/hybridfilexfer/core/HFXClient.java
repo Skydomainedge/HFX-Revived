@@ -48,7 +48,33 @@ public abstract class HFXClient extends HFXService {
     private int clientCapabilities = ProtocolConstants.ALL_V4_CAPS;
     private volatile List<ServerNetInterface> negotiatedRails = Collections.emptyList();
     private volatile List<InetAddress> resolvedBindAddresses = Collections.emptyList();
+    private volatile boolean adbRailFailedWithNonAdbAlternatives = false;
+    private volatile String lastAdbRailFailureReason = null;
     private final AtomicBoolean exitNotified = new AtomicBoolean(false);
+
+    /**
+     * Outcome returned by {@link #prepareAdbRailBeforeDataConnect(List)} when preparing
+     * prerequisites (such as on-demand {@code adb forward}) for an advertised ADB rail.
+     */
+    public static final class AdbRailPrepareResult {
+        public final boolean ready;
+        public final boolean abortImmediately;
+        public final String reason;
+
+        private AdbRailPrepareResult(boolean ready, boolean abortImmediately, String reason) {
+            this.ready = ready;
+            this.abortImmediately = abortImmediately;
+            this.reason = reason;
+        }
+
+        public static AdbRailPrepareResult ready() {
+            return new AdbRailPrepareResult(true, false, null);
+        }
+
+        public static AdbRailPrepareResult failed(String reason, boolean abortImmediately) {
+            return new AdbRailPrepareResult(false, abortImmediately, reason);
+        }
+    }
 
     public HFXClient(String serverControllerAddress, int serverPort, String homeDir) {
         this.serverControllerAddress = serverControllerAddress;
@@ -94,6 +120,14 @@ public abstract class HFXClient extends HFXService {
         this.clientCapabilities = capabilities;
     }
 
+    public boolean isAdbRailFailedWithNonAdbAlternatives() {
+        return adbRailFailedWithNonAdbAlternatives;
+    }
+
+    public String getLastAdbRailFailureReason() {
+        return lastAdbRailFailureReason;
+    }
+
     @Override
     public List<IpcDtos.RailStatusInfo> getRailStatusInfos(String state, String udcSpeed) {
         List<IpcDtos.RailStatusInfo> base = super.getRailStatusInfos(state, udcSpeed);
@@ -123,14 +157,41 @@ public abstract class HFXClient extends HFXService {
         return rail.clientBindAddress;
     }
 
+    /**
+     * Optional hook for subclasses to bind the control socket to a same-subnet local NIC.
+     */
+    protected InetAddress resolveControlBindAddress(InetAddress controlAddress) {
+        return null;
+    }
+
+    /**
+     * Hook invoked right after receiving the server's rail list and before opening data channels.
+     * Subclasses (e.g. PC engine) can lazily establish {@code adb forward} when a direct/mDNS
+     * connection encounters an {@link RailType#ADB} rail advertised by the mobile server.
+     */
+    protected AdbRailPrepareResult prepareAdbRailBeforeDataConnect(List<ServerNetInterface> rails) {
+        return AdbRailPrepareResult.ready();
+    }
+
     public boolean connect(ConnectServerCallback callback) throws IOException {
+        this.adbRailFailedWithNonAdbAlternatives = false;
+        this.lastAdbRailFailureReason = null;
         SocketChannel controlSocket = null;
         try {
             callback.onConnectingControlChannel(serverControllerAddress, serverPort);
             controlSocket = SocketChannel.open();
             SocketTuner.tune(controlSocket);
+            InetAddress controlRemoteAddr = InetAddress.getByName(serverControllerAddress);
+            InetAddress controlBindAddr = resolveControlBindAddress(controlRemoteAddr);
+            if (controlBindAddr != null) {
+                try {
+                    controlSocket.bind(new InetSocketAddress(controlBindAddr, 0));
+                } catch (IOException ignored) {
+                    // Fall back to OS routing table if local source bind fails
+                }
+            }
             controlSocket.socket().connect(
-                    new InetSocketAddress(serverControllerAddress, serverPort),
+                    new InetSocketAddress(controlRemoteAddr, serverPort),
                     ProtocolConstants.SOCKET_CONNECT_TIMEOUT_MS);
             ctChannel = new DataByteChannel(controlSocket);
 
@@ -209,13 +270,56 @@ public abstract class HFXClient extends HFXService {
                 totalStreams += streamCount;
             }
 
+            boolean hasAdbRail = false;
+            boolean hasNonAdbRail = false;
+            ServerNetInterface firstAdbRail = null;
+            for (ServerNetInterface rail : rails) {
+                if (isAdbRail(rail)) {
+                    hasAdbRail = true;
+                    if (firstAdbRail == null) {
+                        firstAdbRail = rail;
+                    }
+                } else {
+                    hasNonAdbRail = true;
+                }
+            }
+
+            if (hasAdbRail) {
+                AdbRailPrepareResult prep = prepareAdbRailBeforeDataConnect(rails);
+                if (prep != null && !prep.ready) {
+                    String failedName = firstAdbRail != null ? firstAdbRail.name : ProtocolConstants.USB_ADB_RAIL_NAME;
+                    String reason = (prep.reason != null && !prep.reason.trim().isEmpty())
+                            ? prep.reason.trim() : "ADB port forward unavailable";
+                    this.lastAdbRailFailureReason = reason;
+                    if (hasNonAdbRail) {
+                        this.adbRailFailedWithNonAdbAlternatives = true;
+                        callback.onConnectTransferChannelFailed(
+                                failedName,
+                                firstAdbRail != null ? firstAdbRail.address : null,
+                                new IOException(reason));
+                        abortHandshakeAndAwaitServerClose(ctChannel, controlSocket, failedName);
+                        closeQuietly(ctChannel);
+                        return false;
+                    }
+                    if (prep.abortImmediately) {
+                        callback.onConnectTransferChannelFailed(
+                                failedName,
+                                firstAdbRail != null ? firstAdbRail.address : null,
+                                new IOException(reason));
+                        abortHandshakeAndAwaitServerClose(ctChannel, controlSocket, failedName);
+                        closeQuietly(ctChannel);
+                        return false;
+                    }
+                }
+            }
+
             // Connect all (railId, streamIdx) data channels concurrently
             List<InetAddress> effectiveBinds = new ArrayList<>(rails.size());
             for (ServerNetInterface rail : rails) {
                 effectiveBinds.add(resolveLocalBindAddress(rail));
             }
             List<TransferConnection> established = connectDataChannelsParallel(
-                    rails, effectiveBinds, totalStreams, sessionToken, callback);
+                    rails, effectiveBinds, totalStreams, sessionToken, controlSocket, hasNonAdbRail, callback);
             if (established == null) {
                 closeQuietly(ctChannel);
                 return false;
@@ -284,6 +388,8 @@ public abstract class HFXClient extends HFXService {
             List<InetAddress> effectiveBinds,
             int totalStreams,
             final byte[] sessionToken,
+            final SocketChannel controlSocket,
+            final boolean hasNonAdbRail,
             final ConnectServerCallback callback) throws IOException {
         for (int i = 0; i < rails.size(); i++) {
             ServerNetInterface rail = rails.get(i);
@@ -296,6 +402,8 @@ public abstract class HFXClient extends HFXService {
         final AtomicReference<String> firstFailedRail = new AtomicReference<>(null);
         final AtomicReference<InetAddress> firstFailedAddr = new AtomicReference<>(null);
         final AtomicReference<Exception> firstError = new AtomicReference<>(null);
+        final AtomicBoolean adbRailFailed = new AtomicBoolean(false);
+        final AtomicBoolean nonAdbRailFailed = new AtomicBoolean(false);
 
         for (int railId = 0; railId < rails.size(); railId++) {
             final int rId = railId;
@@ -322,6 +430,11 @@ public abstract class HFXClient extends HFXService {
                                     rId, streamIdx, rail.name, rail.railType, new DataByteChannel(sc));
                         } catch (Exception e) {
                             closeQuietly(sc);
+                            if (isAdbRail(rail)) {
+                                adbRailFailed.set(true);
+                            } else {
+                                nonAdbRailFailed.set(true);
+                            }
                             if (firstFailedRail.compareAndSet(null, rail.name)) {
                                 firstFailedAddr.set(rail.address);
                                 firstError.set(e);
@@ -342,6 +455,7 @@ public abstract class HFXClient extends HFXService {
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 failed = true;
+                nonAdbRailFailed.set(true);
                 if (firstFailedRail.compareAndSet(null, "INTERRUPTED")) {
                     firstError.set(e);
                 }
@@ -360,15 +474,40 @@ public abstract class HFXClient extends HFXService {
             String failedName = firstFailedRail.get() != null ? firstFailedRail.get() : "unknown";
             InetAddress failedAddr = firstFailedAddr.get();
             Exception ex = firstError.get() != null ? firstError.get() : new IOException("Data channel connect failed");
-            callback.onConnectTransferChannelFailed(failedName, failedAddr, ex);
-            try {
-                ctChannel.writeBoolean(false);
-                ctChannel.writeUTF(failedName);
-            } catch (IOException ignored) {
+            if (adbRailFailed.get() && !nonAdbRailFailed.get() && hasNonAdbRail) {
+                this.adbRailFailedWithNonAdbAlternatives = true;
+                this.lastAdbRailFailureReason = ex.getMessage();
             }
+            callback.onConnectTransferChannelFailed(failedName, failedAddr, ex);
+            abortHandshakeAndAwaitServerClose(ctChannel, controlSocket, failedName);
             return null;
         }
         return result;
+    }
+
+    private static boolean isAdbRail(ServerNetInterface rail) {
+        return rail != null && (rail.railType == RailType.ADB
+                || ProtocolConstants.USB_ADB_RAIL_NAME.equalsIgnoreCase(rail.name));
+    }
+
+    private static void abortHandshakeAndAwaitServerClose(DataByteChannel ctrl,
+                                                          SocketChannel controlSocket,
+                                                          String failedName) {
+        if (ctrl == null) {
+            return;
+        }
+        try {
+            ctrl.writeBoolean(false);
+            ctrl.writeUTF(failedName != null ? failedName : "unknown");
+            if (controlSocket != null && controlSocket.isOpen()) {
+                controlSocket.socket().setSoTimeout(500);
+                try {
+                    controlSocket.socket().getInputStream().read();
+                } catch (IOException ignored) {
+                }
+            }
+        } catch (IOException ignored) {
+        }
     }
 
     /**
