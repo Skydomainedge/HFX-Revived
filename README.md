@@ -1,284 +1,217 @@
-# 多轨快传
-多轨快传（原双轨快传），一个可以同时使用USB和WIFI等多张网卡传输文件到电脑的软件。
+<div align="center">
 
-用尽手机一切对外可用IO通道，提升传输速度。
+# HFX-Revived
 
-USB2.0+WIFI6（千兆网口）可以跑到150MB/s（40+110MB/s）！
+**Next-Generation Multi-Rail File Transfer Engine (HybridFileXfer v4 Overhaul)**
 
-USB2.0+WIFI6_5G:160mhz+WIFI6_2.4G:40mhz 可以跑到200+MB/s！
+通过并行聚合 **USB 内核态虚拟网卡（NCM / RNDIS）**、**现代异步多流 ADB** 与 **6 GHz / 5 GHz Wi-Fi** 等多条异构 I/O 轨道，榨干移动设备与 PC 之间的物理带宽极限。
 
-## 速度测试（USB2.0+WIFI6:GbE）
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE.txt)
+[![CI Build](https://github.com/Skydomainedge/HFX-Revived/actions/workflows/build.yml/badge.svg)](https://github.com/Skydomainedge/HFX-Revived/actions/workflows/build.yml)
+[![Protocol](https://img.shields.io/badge/Protocol-HFX%20v400-0ea5e9.svg)](#architecture)
+[![Core Bytecode](https://img.shields.io/badge/Core-Java%208-orange.svg)](#monorepo-structure)
+[![PC Engine](https://img.shields.io/badge/PC%20Engine-Java%2017%2B%20%7C%20.NET%208%20Win11-6366f1.svg)](#quick-start)
+[![Android](https://img.shields.io/badge/Android-API%2024%2B-3ddc84.svg)](#quick-start)
+[![Forked From](https://img.shields.io/badge/Forked%20From-weixiansen574%2FHybridFileXfer-64748b.svg)](https://github.com/weixiansen574/HybridFileXfer)
+[![AI Assisted](https://img.shields.io/badge/Vibe%20Coding-Antigravity%20%2B%20Gemini%204%20Neon%20%28XHigh%29-8b5cf6.svg)](#开发背景与-ai-协作声明)
 
-![PixPin_2024-04-15_20-42-19](PixPin_2024-04-15_20-42-19.png)
+[核心特性](#核心特性) · [架构设计](#architecture) · [当前阶段实测](#当前阶段实测与演进目标) · [快速上手](#quick-start) · [源码构建](#build-from-source) · [路线图](#roadmap) · [开发声明](#开发背景与-ai-协作声明) · [致谢与许可](#upstream-attribution--license)
 
-![PixPin_2024-04-15_20-45-49](PixPin_2024-04-15_20-45-49.png)
+</div>
 
+---
 
+> [!NOTE]
+> **项目溯源与变更声明（GPL-3.0 Section 5a）**  
+> **HFX-Revived** 是基于 [`weixiansen574/HybridFileXfer`](https://github.com/weixiansen574/HybridFileXfer)（v3.0.0-beta，基线提交 `14e75ab`）于 **2026 年 11 月**发起的深度架构重构衍生项目（`v4` 系列）。在保留上游多轨并行传输核心理念的基础上，对传输引擎、协议栈、有线高速轨、双端无头 IPC 解耦及零配置扫码发现进行了系统级重写。
 
-# 使用
+> [!IMPORTANT]
+> **维护者自述与 AI 协作透明声明（Vibe Coding）**  
+> 本人目前仍处于 **Vibe Coding 学习阶段**，个人编码与大型工程管理能力有限；当前 `v4`（M1–M4）版本的核心架构重构、代码实现、自动化测试与文档体系均基于 **Google Antigravity（反重力）Agent 底座** 与 **Gemini 4 Neon (XHigh)** 模型协作完成。虽然项目内置了多模块单测、字节码红线守护与 SHA-256 校验脚本，但仍可能存在极端环境下的边界缺陷，建议传输重要数据前先小规模试传校验，也诚挚欢迎各位开发者通过 Issue / PR 指正与共建。
 
-## 模式
+## 核心特性
 
-IO服务的启动模式，可选正常、ROOT、ADB，依靠Shizuku启动。
+- **HFX v400 高吞吐传输内核（`:core`）**
+  - 修复底层部分写入（`writeFully`）风险，引入线程私有头缓冲与单次 `GatheringByteChannel` (`writev`) 聚集发送；
+  - 统一 `4 MB` Socket 收发缓冲与 `TCP_NODELAY`，协议升级至 `VERSION_CODE = 400`，支持单轨多并发流、`HFXD` 显式数据通道握手与 `HMAC-SHA256` 会话鉴权；
+  - 接收端引入访问序 LRU 多文件句柄池（`OpenFileHandle`），解决异构快慢轨乱序抵达导致的反复 `open / setLength / close` 抖动。
+- **双轨并进的有线高速引擎**
+  - **内核态 USB 网卡优先（`ncm*` / `usb*` / `rndis*`）**：Android 引擎一等公民识别 USB 虚拟网卡、自动探测只读 UDC 物理协商速率，并在检测到活动 USB 网卡时与 `USB_ADB` 自动互斥防止同线争抢；PC 端按最长前缀自动同网段 `bind` 源 IP，规避多网关与代理 TUN 劫持；
+  - **现代 ADB 异步突发兜底**：PC `AdbManager` 自动降序探测最高版本 `adb`、进程级注入 `ADB_LIBUSB=1` / `ADB_BURST_MODE=1`（不污染系统环境变量），缺失 `delayed_ack` 时自动协商 4 并发流突破单流停等瓶颈。
+- **双端无头业务内核与显示层 IPC 彻底剥离**
+  - **PC 侧（`:pc-engine`）**：纯无头守护进程，零 UI/AWT/Swing 引用，通过统一 JSON-RPC 2.0 NDJSON 本地 IPC（`--ipc=stdio` Sidecar / `AF_UNIX` / Loopback + 一次性 `ipcToken`）向任意未来桌面壳（Tauri / WinUI 3 / Compose Desktop 等）提供服务；
+  - **Android 侧（`HfxEngineService`）**：前台 `dataSync` 服务唯一持有 `HFXServer` 与 `IIOService`（支持普通 / Shizuku / Root）生命周期，通过 `IHfxEngine.aidl` 暴露同构契约，永久移除静态 `HFXServer.instance`，旋转屏幕或切后台传输零中断。
+- **mDNS 零配置自动发现 + 图片式 PNG QR + Win11 原生通知**
+  - 彻底摒弃控制台字符拼二维码：`:pc-engine` 内置纯 Java 零 AWT 编码器输出 **480×480 24-bit RGB PNG**，配对成功/取消/120s 过期/退出时强制清理临时文件；
+  - 升级 C# .NET 8 `HybridFileXferLauncher` 为 Win11 原生 Toast 通知宿主（严守内联 `hint-crop="none"` 防裁切规范，支持「放大查看」/「取消」与配对后自动撤回）；
+  - 多网卡清洗 `JmDNS` 监听 `_hfx._tcp.local.`，支持首次扫码后信任落盘与二次免扫码 `<1s` HMAC 自动秒连，并在 Windows 防火墙拦截 `:5741` 入站回调时自动切换 **mDNS `pair_ack` 反向兜底**；
+  - Android 端提供零 GMS 离线 **CameraX + ZXing** 扫码框（头部一键唤起，识别后约 1s 状态动效反馈并平滑返回）。
 
-ROOT可以访问data目录那些的，权限最高，ADB权限也稍微高那么点点，比如可以访问外置SD卡目录。
+---
 
-注意：`~/Android/data/`目录需要ROOT模式，ADB做不到。请不要指责我，感到不适请发邮件到谷歌安卓部那抗议！
+<a id="当前阶段实测与演进目标"></a>
+## 当前阶段实测与演进目标
 
-## 网卡与通道
+| 阶段指标 | 实测情况 | 说明 |
+|---|---|---|
+| **当前阶段多轨聚合实测** | **~434 MB/s**（6 GHz Wi-Fi + USB 多轨聚合） | 相比旧版有线单流 ADB 停等（~40–50 MB/s）实现数量级跨越 |
+| **当前测试环境瓶颈** | **受限于当前个人测试机有线网卡（2.5GbE）** | 434 MB/s 仅为当前硬件条件下的阶段性成绩，**并非本项目引擎架构的最终上限** |
+| **后续硬件与极限目标** | **5 Gbps / 10 Gbps 有线网卡 + 多频 Wi-Fi 7 MLO / 高速 USB** | 后续硬件升级至 5GbE / 10GbE 网卡后，将结合下一代协议与调度算法继续冲击更高聚合带宽 |
 
-选择要用于传输的网卡，一个网卡一个通道。
+> [!TIP]
+> 本项目附带开箱即用的流式 SHA-256 完整性校验工具（[`scripts/verify-transfer-sha256.bat`](./scripts/verify-transfer-sha256.bat)），支持一键生成不可压缩随机测试集并跨 PC ↔ 手机逐文件校验字节大小与 `SHA-256` 100% 零受损。
 
-只要能被识别为网卡的，都会显示在网卡列表中，比如这些
+---
 
-- 连接一个WIFI
-- 连接双WLAN加速的辅助WIFI
-- 打开热点
-- USB网络共享
-- 蓝牙网络共享（不建议用）
-- 物理以太网口
-- VPN软件的TUN网卡（请勿选择）
-- ~~蜂窝网络~~（已过滤，若有需要请修改编译源码）
+<a id="architecture"></a>
+## 架构设计与模块分层
 
-请选择**可以同电脑进行局域网传输**的网卡
+通过 Gradle 多模块依赖关系与自动化字节码守护测试，从**编译期**杜绝传输业务内核反向依赖任何 UI / Console / View 框架：
 
-USB_ADB的连接比较特殊，它是通过`adb forward tcp:<port> tcp:<port>`转发命令实现的，将手机的端口转发到本机（127.0.0.1）上，使其能够通过USB进行网络传输。
+```mermaid
+flowchart TB
+    subgraph PC["PC 侧（Headless Engine + Thin Shell / Future UI）"]
+        PC_HOST["Win11 原生 Toast 宿主 (HybridFileXferLauncher)\n或 CLI 兜底 (:pc-shell) / 未来现代桌面壳"]
+        PC_IPC{{"JSON-RPC 2.0 over NDJSON\n(stdio / AF_UNIX / Loopback+Token)"}}
+        PC_ENG[":pc-engine 无头内核\nAdbManager · NicSelector · JmDNS · PairingServer · 480px PNG QR"]
+        PC_HOST --> PC_IPC --> PC_ENG
+    end
 
-## 连接
+    subgraph MOB["Android 侧（Foreground Service + Thin UI / Future UI）"]
+        MOB_UI["极薄 UI 壳 (MainActivity · QrScanActivity · TransferActivity)\n或未来 Jetpack Compose / Flutter 壳"]
+        MOB_IPC{{"IHfxEngine.aidl + IHfxEngineCallback.aidl\n(+ 预留 Abstract LocalServerSocket JSON-RPC 桥)"}}
+        MOB_ENG["HfxEngineService 前台无头服务\nHfxEngineController · UsbNicAdvisor · NsdAdvertiser · PairClient · TrustedPcStore"]
+        MOB_UI --> MOB_IPC --> MOB_ENG
+    end
 
-### 手机端
-
-插上数据线并连接WIFI，WIFI**需要与电脑处在同一局域网内**（推荐电脑使用网线直连路由器）
-
-USB_ADB的连接需要USB调试，请到开发者选项中打开，**如果你因各种原因不能使用ADB，可以改用USB网络共享代替ADB。**
-
-主界面选择好模式后点击按钮`启动服务器并等待连接`，状态显示“等待连接”后，电脑双击运行启动脚本`启动_ADB连接.bat`（或者你根据启动参数自己编写一个）。如果提示没有java，则需要[安装java运行环境](https://www.oracle.com/java/technologies/javase/jdk17-archive-downloads.html)，安装过程不过多阐述，与我的世界安装java环境过程一致。ADB连接方式下，程序首先执行adb转发端口（USB通道），若电脑未授权USB调试，请点击手机上的“允许这台电脑进行调试”。端口转发完成后，启动电脑客户端，客户端先连接控制通道，然后从控制通道获取手机指定的传输通道网卡信息，然后电脑客户端连接到这些传输通道网卡，选择的线路都连接成功后，『传输文件』按钮亮起即可进行文件传输。
-
-|                        选择模式与网卡                        |                           电脑连接                           |
-| :----------------------------------------------------------: | :----------------------------------------------------------: |
-| ![Screenshot_2024-10-13-13-21-20-325_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-13-21-20-325_top.weixiansen574.hybridfilexfer.jpg) | ![Screenshot_2024-10-13-13-20-59-747_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-13-20-59-747_top.weixiansen574.hybridfilexfer.jpg) |
-
-### 电脑客户端连接
-
-通道分为控制通道与传输通道，控制通道用于通知对方发送或接收文件、列出文件夹、创建文件夹等，传输通道用于传输文件。
-
-`-c` 参数指定的是控制通道的连接方式，为`adb`或IP地址，IP地址可填写任意一个手机的网卡IP。
-
-**参数说明**
-
-```
-Usage: HybirdFileXfer [OPTION]...
-	使用多 I/O 通道（如 USB 和 WiFi）加速从手机到电脑的文件传输。
-
-Mandatory arguments:
-	-c, --connect=ADDRESS	指定连接方式:
-				adb      = 使用 ADB 连接
-				IP_ADDR  = 使用网络直连 (如 192.168.1.114)
-	-s, --device=ID		指定 USB 设备 ID
-	-d, --dir=DIRECTORY	设置电脑接收目录 (默认: /)
-
-Other options:
-	-h, --help		显示此帮助信息
-	-v, --version		显示版本信息
-
-Examples:
-	HybirdFileXfer -c adb
-	HybirdFileXfer -c adb -s 2dd16815 -d C:\Users\Downloads
-	HybirdFileXfer -c 192.168.1.114 -d D:\Transfer\Files
-
-Report bugs to: <https://github.com/weixiansen574/HybirdFileXfer/issues>
-
-```
-
-**完整启动命令示例**
-
-```
-java -jar HybridFileXfer.jar -c adb
-java -jar HybridFileXfer.jar -c adb -s abcd1234
-java -jar HybridFileXfer.jar -c adb -d C:\Users\Administrator\Desktop\
-java -jar HybridFileXfer.jar -c 192.168.1.2
+    CORE[":core 纯 Java 8 共享传输内核\nHFX v400 · DataByteChannel(writev) · LRU WriteFileCall · HMAC · IPC DTO"]
+    PC_ENG --> CORE
+    MOB_ENG --> CORE
 ```
 
-**电脑输出**
+<a id="monorepo-structure"></a>
+### Monorepo 模块结构
 
+| 模块 / 目录 | 语言与字节码基线 | 职责边界 |
+|---|---|---|
+| `:core` | Java 8（major 52） | 双端唯一共享传输引擎、HFX v400 协议、HMAC/配对编解码、统一 IPC DTO（严格零 Android / UI / `PrintStream`） |
+| `:pc-engine` | Java 17 | PC 无头传输引擎守护进程，产出 `hfx-engine-*.jar`（严格零 AWT / Swing / Android / 业务 `PrintStream`） |
+| `:pc-shell` | Java 17 | 极薄 CLI 壳与轻量 Win11 Toast 兜底，100% 向后兼容 `-c adb` / `-c <ip>`，产出 `hfx-shell-*.jar` |
+| `HybridFileXferLauncher` | C# / .NET 8（Win11） | 原生 WinRT Toast 通知托管宿主（`--ipc=stdio`），负责无裁切 QR 展示、动作交互与配对自动撤回 |
+| `:android` | Java 8 + JNI C++ | `engine/` 无头前台服务层（零 UI / `PrintStream` 字节码守护）+ 极薄展示壳与离线 CameraX/ZXing 扫码页 |
+| `scripts/` | Batch / PowerShell | Windows 一键双击启动脚本（自动发现/扫码、ADB Turbo、USB 网卡/IP 直连、IPC 调试）与 SHA-256 校验器 |
+
+---
+
+<a id="quick-start"></a>
+## 快速上手
+
+### 环境要求
+- **PC 端**：Windows 10/11（或 Linux/macOS 使用纯 Java CLI）、JDK 17+（推荐 JDK 21）；使用 Win11 原生 Toast 宿主需 `.NET 8` 运行时。
+- **Android 端**：Android 7.0+（API 24+）；访问 `/Android/data` 等受限目录可选配合 [Shizuku](https://shizuku.rikka.app/)（ADB / Root 模式）。
+
+### 方式一：零配置自动发现与 Win11 通知扫码绑定（推荐）
+
+1. 在手机端安装 `android-debug.apk` 并授予文件读写权限。
+2. PC 端双击 [`scripts/start-auto-pair.bat`](./scripts/start-auto-pair.bat)：
+   - **首次绑定**：输入 `pair` 回车 → Windows 11 右下角弹出内联 **480×480 无裁切二维码**通知（支持「放大查看」与「取消」）；
+   - **手机扫码**：点击手机主页顶部扫码图标 → 对准电脑二维码 → 识别后动效反馈约 1 秒并自动返回、拉起服务并建立 HMAC 加密多轨连接（若 Windows 防火墙拦截 `:5741`，2 秒内自动切换 mDNS `pair_ack` 反向兜底）；
+   - **二次使用**：手机点击「启动服务器并等待连接」，PC 双击 `start-auto-pair.bat` 直接回车 → mDNS `<1s` 自动发现已信任设备并免扫码秒连。
+
+### 方式二：快捷脚本与经典 CLI（100% 向后兼容）
+
+| 场景 | Windows 一键脚本 | 等价命令行 |
+|---|---|---|
+| **自动发现 / 首次扫码** | `scripts/start-auto-pair.bat` | `HybridFileXferLauncher.exe [--pair]` 或 `java -jar hfx-shell.jar --auto` |
+| **ADB 极速有线轨** | `scripts/start-adb-turbo.bat` | `java -jar hfx-shell.jar -c adb [-s <serial>] [--adb-streams=4]` |
+| **USB 网卡 / Wi-Fi 直连** | `scripts/start-usb-nic-or-ip.bat` | `java -jar hfx-shell.jar -c <phone-ip> [-d <dir>]` |
+| **无头引擎 IPC 守护** | `scripts/start-engine-ipc.bat` | `java -jar hfx-engine.jar --ipc=tcp://127.0.0.1:0` |
+| **测速造数 & SHA-256 校验** | `scripts/verify-transfer-sha256.bat` | 详见 [`scripts/README_TESTING_GUIDE.md`](./scripts/README_TESTING_GUIDE.md) |
+
+<details>
+<summary><b>展开查看完整 CLI 参数与 JSON-RPC 2.0 本地 IPC 契约速查</b></summary>
+
+#### PC CLI 参数（`hfx-shell-*.jar`）
+```text
+--auto                 自动 mDNS 发现已信任设备，未发现则推送 PNG QR 通知
+--pair                 立即生成 480x480 PNG QR 并推送 Win11 通知
+--no-toast             禁用 Win11 通知弹窗（仅输出 PNG 绝对路径）
+-c, --connect=ADDR     adb 或手机网卡 IP（向后兼容旧版脚本）
+-s, --device=SERIAL    多台 ADB 设备时指定序列号
+-d, --dir=DIR          可选默认目录元数据（文件管理首屏默认展示盘符根目录 /）
+--adb-path=PATH        指定额外的 adb 可执行文件路径
+--adb-legacy           关闭进程级 ADB_LIBUSB / ADB_BURST_MODE 注入（便于对比测速）
+--adb-streams=1..8     覆盖 USB_ADB 并发流数
+--no-auto-bind         关闭同网段自动源 IP 绑定
 ```
-adb:5740
-USB_ADB : 5740 端口转发成功！
-正在连接 网卡名：USB_ADB 远程地址：127.0.0.1 绑定地址：null
-正在连接 网卡名：wlan1 远程地址：192.168.8.242 绑定地址：null
-正在连接 网卡名：wlan0 远程地址：192.168.8.146 绑定地址：null
-传输通道已全部连接完成
+
+#### 双端统一 IPC 命令与事件（`:core/ipc`）
+- **命令**：`engine.get_snapshot`、`engine.refresh_nics`、`engine.shutdown`、`pair.start_qr`、`pair.cancel`、`pair.submit_qr_uri`、`peers.list`、`peers.remove`、`server.start`、`server.stop`、`session.connect`、`session.disconnect`、`fs.list`、`fs.mkdir`、`fs.delete`、`transfer.start`、`transfer.cancel`
+- **推送事件**：`pair.qr_ready`、`pair.succeeded`、`pair.failed`、`pair.expired`、`mdns.peer_discovered`、`mdns.peer_lost`、`session.state_changed`、`rail.status`、`rail.conflict_resolved`、`adb.version_warning`、`diagnostic.warning`、`transfer.progress`（250ms 节流）、`transfer.completed`、`transfer.error`
+
+</details>
+
+---
+
+<a id="build-from-source"></a>
+## 源码构建与测试
+
+在仓库根目录执行全量测试与产物构建（需本机配置 Android SDK / NDK `26.1.10909125` / CMake `3.22.1` 与 JDK 17/21）：
+
+```powershell
+# 1. 全量单元测试 + 无头引擎/薄壳 Fat JAR + Android Debug APK
+.\gradlew.bat :core:test :pc-engine:test :pc-engine:shadowJar :pc-shell:test :pc-shell:shadowJar :android:testDebugUnitTest :android:assembleDebug --no-daemon
+
+# 2. 编译 Windows 11 原生 Toast 宿主（Release）并运行防裁切 XML 自检
+dotnet build HybridFileXferLauncher\HybridFileXferLauncher.csproj -c Release
+.\HybridFileXferLauncher\bin\Release\net8.0-windows10.0.19041.0\HybridFileXferLauncher.exe --verify-toast-xml
 ```
 
-### 技巧
+构建产物默认输出至：
+- `pc-engine/build/libs/hfx-engine-4.0.0-SNAPSHOT.jar`
+- `pc-shell/build/libs/hfx-shell-4.0.0-SNAPSHOT.jar`
+- `HybridFileXferLauncher/bin/Release/net8.0-windows10.0.19041.0/HybridFileXferLauncher.exe`
+- `HybridFileXfer-Android/app/build/outputs/apk/debug/android-debug.apk`
 
-- 很多手机支持双WIFI加速，用上速度可以再增加！小米手机：WLAN => WLAN助理 => 智能多网加速 => 双WLAN加速，选择第二条不同频段的WIFI，可实现5Ghz+2.4Ghz加速！其他手机自行探索。**连上第二条WIFI后记得刷新下网卡列表**。
+---
 
-- 如果你没有路由器，但电脑有无线网卡，可以手机打开热点给电脑或反过来操作，即可建立电脑与手机之间的无线局域网，进行文件传输
+<a id="roadmap"></a>
+## 演进路线图（Roadmap）
 
-- 如果5Ghz频段WIFI已可以跑满你电脑的千兆网口，你没有2.5G网口，如何通过双WLAN加速来提高传输速度？
+- [x] **M1**：Monorepo 统一、HFX v400 多流与 HMAC 协议、`writev` / `writeFully` / LRU 句柄池修复、统一 IPC DTO
+- [x] **M2**：PC `AdbManager`（高版择优 / 异步突发 / 4 流兜底）+ 同网段源 IP `bind` + Android `UsbNicAdvisor` 同线互斥
+- [x] **M3**：双端无头业务内核与展示层 IPC 彻底剥离、PC 默认盘符首屏、快捷测试脚本与 SHA-256 校验器
+- [x] **M4**：多网卡 `JmDNS` 零配置发现、纯 Java 480×480 PNG QR、Win11 原生 Toast 宿主、防火墙 `pair_ack` 反向兜底与离线扫码框
+- [ ] **下一阶段探索（v4.5 / v5 调研中）**：
+  - 5 Gbps / 10 Gbps 有线网卡环境与 Wi-Fi 6E 双流 / Wi-Fi 7 MLO 多频聚合极限压榨；
+  - USB 3.2 Gen 2 / CDC-NCM NTB 深度调优与可选 Root/KernelSU 网卡 RPS/IRQ 绑核及流控调度；
+  - Chunk 级分片记忆、掉线断点续传与原地整片整合；
+  - 海量小文件动态归并打包流管线与异构快慢轨工作窃取（Work-Stealing）调度算法；
+  - 现代化跨端 UI 壳演进（含独立成行快捷路径跳转标签栏等体验升级）。
 
-  - 如果电脑还有一个无线网卡。电脑打开一个不同频段的热点，然后手机连接电脑的热点作为辅助WLAN。或者手机打开与已连接WIFI不同频段的热点（切勿相同频段，能打开成功但一定会干扰降速！），电脑连接手机开的热点。
+---
 
-  - 如果电脑有两个千兆网卡。方法一是网卡合并，效果最好但是难以操作。方法二：两条网线都插入路由器，此时两张网卡各自一个IP地址。手机开启双WLAN加速，连接两个频段的WIFI。返回软件，此时由于电脑两张网卡都连接着同一上级路由，若系统默认分配，可能双WLAN的流量都走同一张网卡！所以需要在手机上设置『电脑指定网卡IP』使这两条通道各自走独立的电脑网卡。各自填写上对应的电脑网卡IP即可。
+<a id="开发背景与-ai-协作声明"></a>
+## 开发背景与 AI 协作声明
 
-## 其他设备
+- **个人能力与维护边界**：本项目由维护者在 **Vibe Coding 学习与实践** 过程中发起推进。由于个人专业开发经验、底层排障与大型仓库代码管理能力仍然有限，项目迭代节奏、疑难 Issue 响应及复杂跨设备适配可能存在不足，敬请谅解；传输重要资料时请务必结合自带的 `verify-transfer-sha256.bat` 做完整性核验。
+- **AI 工程底座与模型信息**：当前 `v4`（M1–M4）版本的架构设计推进、代码重构、单测编写与实机级回归验证，主要基于 **Google Antigravity（反重力）Agent 底座**，驱动模型为 **Gemini 4 Neon (XHigh)**。
+- **质量兜底手段**：为弥补人工代码审查的局限，仓库通过编译期模块隔离、字节码架构红线守护（零 UI/非法依赖检查）、端到端环回集成测试与 SHA-256 一致性校验来尽量保证工程可靠性。
 
-### Linux电脑
+---
 
-v1.1新增对Linux的支持，下载对应的电脑客户端即可，解压后执行对应命令，例如
+## 参与贡献
 
-```shell
-java -jar HybridFileXfer.jar -c adb
-```
+欢迎通过 Issue 反馈问题与性能实测数据，更欢迎有经验的开发者直接提交 Pull Request 协助审阅与优化代码。提交前请确保本地全量 Gradle 单测（含字节码分层红线守护）与 `.NET` 构建全部通过。
 
-目前仅支持x86 CPU的电脑，虽然Java是跨平台的，但是adb对处理器架构有要求。如果你需要在ARM，RISC-V，龙芯等CPU架构下运行，可以寻找对应处理器架构的adb程序，复制到jar包的同一目录。又或者使用USB网络共享。
+---
 
-### ArchLinux 通过 AUR 安装
+<a id="upstream-attribution--license"></a>
+## 致谢与开源协议
 
-> **重要提示：** 
-> 
-> 本项目的 issue 跟踪器 **仅用于** 讨论项目本身的 Bug 和功能请求。
-> **请不要在这里提交任何与 AUR 打包、`PKGBUILD` 语法、`makepkg` 错误或 AUR 助手相关的问题。** 
-> 如果你遇到 AUR 相关问题，请在 AUR **网页上的包评论区** 或向软件包维护者寻求帮助。
+### 上游溯源与致谢
+- 衷心感谢原项目作者 [**weixiansen574**](https://github.com/weixiansen574) 创建并开源 [`HybridFileXfer`](https://github.com/weixiansen574/HybridFileXfer)，奠定了多轨异构文件传输的核心思路与最初的双端实现。
+- 感谢以下优秀开源项目提供的底层能力：[Shizuku](https://github.com/RikkaApps/Shizuku)、[ZXing](https://github.com/zxing/zxing)、[JmDNS](https://github.com/jmdns/jmdns)、[AndroidX CameraX](https://developer.android.com/training/camerax)、[Gson](https://github.com/google/gson)、[Windows Community Toolkit](https://github.com/CommunityToolkit/WindowsCommunityToolkit)。
 
-本项目已在 [Arch Linux 用户仓库 (AUR)](https://aur.archlinux.org/packages/hybridfilexfer-git) 上发布，你可以使用任何你喜欢的 AUR 助手进行安装，例如：
-```bash
-# 使用 yay
-yay -S hybridfilexfer-git
-
-# 使用 paru
-paru -S hybridfilexfer-git
-```
-安装完成后，你可以通过在终端执行 `HybridFileXfer` 来启动电脑端。
-
-### Mac电脑
-
-个人没尝试在Mac电脑上运行，但Java跨平台，ADB也有对应Mac版，可自己折腾。
-
-### 安卓手机
-
-可在Termux里运行jar文件，具体教程自行搜索。
-
-当然，不用这么麻烦，**本应用自带对传功能**。
-
-主页右上角，『连接手机服务端』，请确保对方手机所勾选网卡IP可连上，可以是同一局域网WIFI或者是热点，控制器通道任选一个网卡IP即可。
-
-**请注意**，不使用ADB转发请不要勾选网卡`USB_ADB`！
-
-至于手机传手机如何利用USB通道？第一方案是OTG线或双头Type-c线，只不过有以下两个问题
-
-- 若在手机端跑动USB连接的ADB，需要ROOT权限。
-- 使用USB网络共享，安卓手机并不能使用
-
-最终的解决方案是：将两台手机同时插到电脑上，用电脑进行转发。将服务端手机的端口用adb转发（forward）到电脑上，再将电脑上的端口用adb转发回（reverse）客户端手机。
-
-两部手机插到电脑后，运行`USB-forward.bat`脚本（中文版本`USB-forward_中文.bat`），按照提示操作即可。
-
-转发完毕后，即可勾选使用USB_ADB网卡。同时，控制通道也可以选择USB_ADB的本地地址127.0.0.1（不是必须的）
-
-![手机对传](手机对传.jpg)
-
-## 传输
-
-连接成功后，点击传输文件按钮，即可开始选择文件进行传输。
-
-UI是双排文件管理器（照搬的MT管理器）。左边文件列表是当前手机的文件列表，右边为电脑的文件列表。
-
-点击文件夹进入子目录，按手机的返回键，返回当前焦点所在目录的上一级。
-
-长按文件或文件夹，进入选择模式。选择完后，长按任意一个被选中的条目，点击确认对话框的确定即开始传输，选中的文件或文集夹将传输到另一侧的目录里。左往右是传输到电脑，反之就是传输电脑文件到手机。
-
-例如：/sdcard/ > [/sdcard/test/] ==> E:\\transfer\\ > [E:/transfer/test/]
-
-|                                                              |                                                              |
-| ------------------------------------------------------------ | ------------------------------------------------------------ |
-| ![Screenshot_2024-10-13-13-59-51-358_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-13-59-51-358_top.weixiansen574.hybridfilexfer.jpg) | ![Screenshot_2024-10-13-14-00-12-221_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-14-00-12-221_top.weixiansen574.hybridfilexfer.jpg) |
-
-
-传输完毕后，点击右上角“←”退出文件列表，点击停止服务器以正常断开与电脑的连接。
-
-## 关于进度条
-
-计算进度是一件比较耗费时间的事情，尤其是遇到许多小文件的时候，计算会非常耗时。例如截图文件夹，计算所消耗的时间就占了总时间的1/3！参照fastcopy的存在。所以没有实现进度条。
-
-## 书签
-
-v1.2.0新增书签功能。
-
-### 添加书签
-
-点击右上角菜单，添加书签。有两个书签列表，一个是**手机**，一个是**电脑**。若当前焦点是本地文件夹，确认后书签将添加至本地文件夹书签列表，若当前焦点是电脑文件夹，确认后书签将添加至电脑文件夹书签列表。
-
-### 跳转书签
-
-点击右上角菜单，书签列表。点击要跳转的书签即可跳转至目标目录。
-
-| 右上角菜单                                                   | 添加书签                                                     | 书签列表                                                     |
-| ------------------------------------------------------------ | ------------------------------------------------------------ | ------------------------------------------------------------ |
-| ![Screenshot_2024-10-13-14-16-19-518_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-14-16-19-518_top.weixiansen574.hybridfilexfer.jpg) | ![Screenshot_2024-10-13-14-16-22-997_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-14-16-22-997_top.weixiansen574.hybridfilexfer.jpg) | ![Screenshot_2024-10-13-14-20-12-558_top.weixiansen574.hybridfilexfer](Screenshot_2024-10-13-14-20-12-558_top.weixiansen574.hybridfilexfer.jpg) |
-
-*演示中的~/Android/data/……目录需要root访问（安卓11以上）*
-
-
-
-# 原理
-
-将文件传给对方，发送方有一个读文件线程和多个网络发送线程，接收方有一个写文件线程和多个网络接收线程。首先由文件读取线程将文件读取到1MB的文件块中，再将块存到队列里，接着继续读到取下一个块。与此同时有多个传输线程同时向队列里取文件分块，然后向网络发送。接收端这里，多个接收线程都有它自己的队列，将接收的文件块插入队尾，与此同时，文件写入线程，获取所有队列队头索引值最小的一个文件块，将其写入硬盘。由于所有队列中，文件块都遵循从小到大的顺序（这就比如你将一组从小到大的数字，按顺序取出，再放到不同的新数组中，这些新的数组里的数字都遵循从小到大的顺序），这样取出来的文件块，索引就是连续的。若网速比硬盘写入速度快时，写入是顺序的，提升机械硬盘这种设备的性能。若网速比硬盘写入速度慢时，由于一接收到块就立刻被写到硬盘里了，写入就是随机的。
-
-具体请查看源码
-
-# 魔法
-
-禁止以任何形式在飞机杯社区（酷安）分享本软件，否则后果自负！
-
-![酷安真正的logo](飞机杯社区（迫真）.svg)
-
-![IMG_20241125_235527](IMG_20241125_235527.jpg)
-
-酷安斐济杯文章来源[https://mp.weixin.qq.com/s/gt8DiwC3kWmyzjLCze1TRg](https://mp.weixin.qq.com/s/gt8DiwC3kWmyzjLCze1TRg)
-
-# 赞助
-
-前赞助计划[2.5G-WIFI6 GL-MT6000 路由器](https://m.tb.cn/h.gcb0Q6flYgnOqrX?tk=ubRnWtrez83)，已通过大家的赞助+自己的费用购买到，谢谢大家的赞助！
-
-喜欢本软件可以赞助支持！
-
-请备注“赞助双轨快传-[你的github ID]”。所有赞助名单都将公布！
-
-若你想匿名赞助，请填写备注`赞助双轨快传`但不备注你的信息，**否则我无法判断收款码收款意图！将不会纳入赞助名单！**
-
-[查看赞助名单](./赞助名单.md)
-
-![1706328825823](1706328825823.jpg)
-
-
-
-## 许可证
-
-本项目使用的JDK来源于 **Dragonwell JDK**，该部分代码受到 **GNU General Public License version 2 (GPL-2.0)**，并且附加 **Classpath Exception** 的保护。
-
-**Dragonwell JDK** 的许可证原文请参见 [Dragonwell JDK License](https://github.com/dragonwell-project/dragonwell21/blob/master/LICENSE)。
-
-本项目整体使用 **GNU General Public License version 3 (GPL-3.0)**，许可证文件可以在 [LICENSE](./LICENSE.txt) 文件中找到。
-
-### Dragonwell JDK License
-
-**Dragonwell JDK** 的代码基于 **GPL-2.0** 发布，并附有 **Classpath Exception**。这些条款允许您将该库与其他独立的模块链接，以创建和分发符合其他许可证要求的可执行文件。
-
-特别说明：
-- 如果你将本项目进行分发，务必保留 **Dragonwell JDK** 的版权声明和许可证原文。
-- 本项目中的其他部分基于 **GPL-3.0**，这意味着任何对本项目的修改和分发必须符合 GPL-3.0 的条款。
-
-## 声明
-
-任何人都可自由提交PR，只要你的代码对该项目有帮助！
-
-欢迎会编写程序的你提交代码为此项目做贡献，而不是只会在Issues里提一些稀奇古怪的建议。
-
-PR列表个人头像表达含义属于他们的自由。与本项目主无关！
-
-## Star History
-
-[![Star History Chart](https://star-history.dera.page/svg?repos=weixiansen574/HybridFileXfer&type=Date)](https://star-history.dera.page/#weixiansen574/HybridFileXfer&Date)
-
+### 许可证
+本项目整体遵循 **GNU General Public License v3.0 (GPL-3.0)** 开源协议，完整协议条款请参阅 [LICENSE.txt](./LICENSE.txt)。基于本项目的任何修改与再分发须遵守 GPL-3.0 协议要求，保留原版权声明、变更说明与完整源代码获取途径。
